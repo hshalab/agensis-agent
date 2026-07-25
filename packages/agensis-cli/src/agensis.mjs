@@ -30,7 +30,7 @@ const DEFAULT_HEARTBEAT_MS = 15 * 1000;
 const DEFAULT_MAX_CONCURRENCY = 2;
 const LEAN_PROMPT_MAX_BYTES = 10 * 1024;
 const DEFAULT_MODEL = "claude-opus-4-8";
-export const AGENSIS_CLI_VERSION = "0.1.29";
+export const AGENSIS_CLI_VERSION = "0.1.30";
 
 export async function runAgensisDaemon(rawConfig = {}) {
   const config = normalizeConfig(rawConfig);
@@ -861,8 +861,20 @@ async function runAgentJob(config, job, { signal }) {
     });
   };
 
+  // One message per finished text block, so a turn reads as the steps the agent
+  // actually took — text, its tools, the next text — instead of one bubble that
+  // keeps growing with five thoughts run together and no place to interrupt.
+  const sendSegment = (segment) => {
+    send(job.ws, {
+      action: "agent_job_segment",
+      jobId: job.id,
+      text: segment.text,
+      elapsedMs: Date.now() - started,
+    });
+  };
+
   sendDelta("");
-  const parser = command.streamJson ? createStreamJsonParser({ onStep: sendStep }) : null;
+  const parser = command.streamJson ? createStreamJsonParser({ onStep: sendStep, onSegment: sendSegment }) : null;
   const progressTimer = setInterval(() => sendDelta(fullContent), 1000);
   if (progressTimer.unref) progressTimer.unref();
 
@@ -1151,19 +1163,43 @@ function leanMcpRuntime(config) {
 // Tool activity (`kind: "tool"` steps) is progress metadata, not reply content:
 // it is raised through onStep and never contributes to live/result, so a step
 // can never leak into what the human reads as the agent's answer.
-function createStreamJsonParser({ onStep } = {}) {
+// Segments are boundaries, not content either: each one carries the finished
+// text of one assistant block, closes that block's live view, and never feeds
+// the accumulators — the same text already arrived as deltas, so adding it
+// would double every answer.
+function createStreamJsonParser({ onStep, onSegment } = {}) {
   let buffer = "";
-  let streamed = ""; // accumulated text_delta tokens (live view)
+  let streamed = ""; // accumulated text_delta tokens of the OPEN block (live view)
   let sawDelta = false;
   let assistantText = ""; // fallback when no token-level deltas arrive
+  let closedText = ""; // text of blocks already closed by a segment
   let finalResult = null; // authoritative text from the `result` event
   let sawAgensisStep = false; // pooled executor already reported this stream's tools
+  let sawAgensisSegment = false; // …and this stream's block boundaries
   const seenToolIds = new Set();
 
   const raiseStep = (step) => {
     if (typeof onStep !== "function" || !step.name) return;
     try {
       onStep(step);
+    } catch {
+      /* a failed progress send must never break parsing the reply */
+    }
+  };
+
+  // A block boundary. The live view restarts from empty so the NEXT message
+  // begins blank instead of replaying this block (deltas are sent as the whole
+  // accumulated string, so without this every message would repeat the ones
+  // before it). The text stays in closedText, so the result fallback is still
+  // the whole turn. Without a listener nothing is closed — a caller that cannot
+  // deliver boundaries keeps the single-message behaviour it had before.
+  const raiseSegment = (segment) => {
+    if (typeof onSegment !== "function") return;
+    closedText += sawDelta ? streamed : assistantText;
+    streamed = "";
+    assistantText = "";
+    try {
+      onSegment(segment);
     } catch {
       /* a failed progress send must never break parsing the reply */
     }
@@ -1178,6 +1214,14 @@ function createStreamJsonParser({ onStep } = {}) {
       if (step && typeof step === "object") {
         sawAgensisStep = true;
         raiseStep({ kind: step.kind || "tool", name: String(step.name || ""), detail: String(step.detail || "") });
+      }
+      return;
+    }
+    if (evt.type === "agensis_segment") {
+      const segment = evt.segment;
+      if (segment && typeof segment === "object") {
+        sawAgensisSegment = true;
+        raiseSegment({ text: String(segment.text || "") });
       }
       return;
     }
@@ -1198,9 +1242,12 @@ function createStreamJsonParser({ onStep } = {}) {
         .join("");
       if (text) assistantText += text;
       // The LocalExecutor path is raw `claude --output-format stream-json`, where
-      // tool calls arrive as tool_use blocks on assistant messages — same steps,
-      // same wire, so both executors behave identically. Skipped once the pooled
-      // executor has sent agensis_step lines, so one tool call is reported once.
+      // a completed text block and the tool calls it announced arrive together on
+      // one assistant message — same segments, same steps, same wire, so both
+      // executors behave identically. Each is skipped once the pooled executor
+      // has sent its own lines, so a block is closed once and a tool reported
+      // once. The segment goes first: the model wrote the text before the tools.
+      if (text && !sawAgensisSegment) raiseSegment({ text });
       if (!sawAgensisStep) {
         for (const block of evt.message.content) {
           if (!block || block.type !== "tool_use") continue;
@@ -1245,7 +1292,7 @@ function createStreamJsonParser({ onStep } = {}) {
     },
     get result() {
       if (finalResult != null) return finalResult;
-      return sawDelta ? streamed : assistantText;
+      return closedText + (sawDelta ? streamed : assistantText);
     },
   };
 }

@@ -136,6 +136,122 @@ test('ignores raw assistant tool_use once the pooled executor has sent agensis_s
   assert.deepEqual(steps, [{ kind: 'tool', name: 'Read', detail: 'a.ts' }]);
 });
 
+// A turn is [text][tool][text][tool][text], but every one of those texts used to
+// be concatenated into ONE growing placeholder message: five separate thoughts
+// ran together in a single bubble with no boundary for the human to read or
+// interrupt at. A segment closes each text block so the transcript becomes one
+// message per block with the tool chips in between.
+test('a multi-block turn raises one segment per text block, in order, without duplicating the reply', () => {
+  const segments = [];
+  const steps = [];
+  const p = createStreamJsonParser({ onStep: (s) => steps.push(s), onSegment: (s) => segments.push(s) });
+  p.feed(lines(
+    { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Only used here.' } } },
+    {
+      type: 'assistant',
+      message: {
+        content: [
+          { type: 'text', text: 'Only used here.' },
+          { type: 'tool_use', id: 'tu_1', name: 'Edit', input: { file_path: 'ChatWindowContent.tsx' } },
+        ],
+      },
+    },
+  ));
+  assert.deepEqual(segments.map((s) => s.text), ['Only used here.']);
+  // The closed block must not replay into the message the server just opened.
+  assert.equal(p.live, '');
+
+  p.feed(lines(
+    { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Now the dialog.' } } },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'Now the dialog.' }] } },
+  ));
+  p.end();
+
+  assert.deepEqual(segments.map((s) => s.text), ['Only used here.', 'Now the dialog.']);
+  assert.deepEqual(steps, [{ kind: 'tool', name: 'Edit', detail: 'ChatWindowContent.tsx' }]);
+  // Each block counted ONCE: the segment carries its own text and never feeds
+  // the accumulators the deltas already filled.
+  assert.equal(p.result, 'Only used here.Now the dialog.');
+});
+
+// The model wrote the text before it called the tools that text announced.
+test('the segment for a block is raised before the steps from the same assistant message', () => {
+  const seen = [];
+  const p = createStreamJsonParser({
+    onStep: (s) => seen.push(`step:${s.name}`),
+    onSegment: (s) => seen.push(`segment:${s.text}`),
+  });
+  p.feed(lines({
+    type: 'assistant',
+    message: {
+      content: [
+        { type: 'text', text: 'Let me look.' },
+        { type: 'tool_use', id: 'tu_1', name: 'Read', input: { file_path: 'a.ts' } },
+        { type: 'tool_use', id: 'tu_2', name: 'Grep', input: { pattern: 'TODO' } },
+      ],
+    },
+  }));
+  assert.deepEqual(seen, ['segment:Let me look.', 'step:Read', 'step:Grep']);
+});
+
+// The pooled SDK executor has no raw assistant messages to forward, so it sends
+// the boundary as its own line.
+test('raises an agensis_segment line as a boundary that restarts the live view', () => {
+  const segments = [];
+  const p = createStreamJsonParser({ onSegment: (s) => segments.push(s) });
+  p.feed(lines(
+    { delta: { type: 'text_delta', text: 'First block.' } },
+    { type: 'agensis_segment', segment: { text: 'First block.' } },
+    { delta: { type: 'text_delta', text: 'Second block.' } },
+  ));
+  p.end();
+  assert.deepEqual(segments, [{ text: 'First block.' }]);
+  assert.equal(p.live, 'Second block.');
+  assert.equal(p.result, 'First block.Second block.');
+});
+
+// Both executors can feed this parser; a block must be closed ONCE.
+test('ignores raw assistant text once the pooled executor has sent agensis_segment lines', () => {
+  const segments = [];
+  const p = createStreamJsonParser({ onSegment: (s) => segments.push(s) });
+  p.feed(lines(
+    { type: 'agensis_segment', segment: { text: 'Only once.' } },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'Only once.' }] } },
+  ));
+  p.end();
+  assert.deepEqual(segments.map((s) => s.text), ['Only once.']);
+  assert.equal(p.result, 'Only once.');
+});
+
+// A turn that produced text but no `result` event still has to resolve to the
+// whole turn, not just the block that was open when it ended.
+test('the result fallback spans every block when no result event arrives', () => {
+  const p = createStreamJsonParser({ onSegment: () => {} });
+  p.feed(lines(
+    { delta: { type: 'text_delta', text: 'One.' } },
+    { type: 'agensis_segment', segment: { text: 'One.' } },
+    { delta: { type: 'text_delta', text: 'Two.' } },
+    { type: 'agensis_segment', segment: { text: 'Two.' } },
+    { delta: { type: 'text_delta', text: 'Three.' } },
+  ));
+  p.end();
+  assert.equal(p.result, 'One.Two.Three.');
+});
+
+// A caller that cannot deliver boundaries keeps exactly the behaviour it had
+// before segments existed — one growing message.
+test('without an onSegment listener the live view stays one growing block', () => {
+  const p = createStreamJsonParser();
+  p.feed(lines(
+    { delta: { type: 'text_delta', text: 'A.' } },
+    { type: 'agensis_segment', segment: { text: 'A.' } },
+    { delta: { type: 'text_delta', text: 'B.' } },
+  ));
+  p.end();
+  assert.equal(p.live, 'A.B.');
+  assert.equal(p.result, 'A.B.');
+});
+
 test('parses normally when no onStep callback is supplied', () => {
   const p = createStreamJsonParser();
   p.feed(lines(

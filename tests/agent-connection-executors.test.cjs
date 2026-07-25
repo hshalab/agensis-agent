@@ -391,6 +391,87 @@ test('claude sdk executor: tool_use with no summarizable input still reports the
   assert.deepEqual(steps.map((m) => m.step), [{ kind: 'tool', name: 'TodoWrite', detail: '' }]);
 });
 
+// A turn is [text][tool][text][tool][text], but the whole turn's text used to
+// land in ONE growing placeholder message — five separate thoughts run together
+// in a single bubble, with nowhere for the human to read or steer between them.
+// The segment closes each completed text block so the server can start the next
+// message; it is emitted BEFORE that block's steps because that is the order the
+// model produced them.
+test('claude sdk executor: emits a segment per assistant text block, ahead of that block’s steps', async () => {
+  const { createClaudeSdkExecutor } = await load();
+  const delta = (text) => ({ type: 'stream_event', session_id: 's1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text } } });
+  const queryFn = ({ prompt }) => {
+    const gen = (async function* () {
+      for await (const _input of prompt) {
+        yield delta('Only used here.');
+        yield {
+          type: 'assistant',
+          session_id: 's1',
+          message: {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: 'Only used here.' },
+              { type: 'tool_use', id: 'tu_1', name: 'Edit', input: { file_path: 'ChatWindowContent.tsx' } },
+            ],
+          },
+        };
+        yield delta('Now the dialog.');
+        yield { type: 'assistant', session_id: 's1', message: { role: 'assistant', content: [{ type: 'text', text: 'Now the dialog.' }] } };
+        yield { type: 'result', subtype: 'success', result: 'Now the dialog.', session_id: 's1' };
+      }
+    })();
+    gen.interrupt = async () => {};
+    return gen;
+  };
+  const ex = createClaudeSdkExecutor({ queryFn });
+
+  const lines = [];
+  const result = await ex.run({ cwd: '/tmp', prompt: 'edit it', sessionKey: 'silo-segment', onData: (c) => lines.push(c) });
+  const parsed = lines.map((l) => JSON.parse(l.trim()));
+
+  // The whole wire, in order — text, then the tool that text announced, then the
+  // next text. Each block's text crosses the wire exactly twice by design: as
+  // live deltas and as the one authoritative segment that closes it.
+  assert.deepEqual(parsed.map((m) => (
+    m.type === 'agensis_segment' ? `segment:${m.segment.text}`
+      : m.type === 'agensis_step' ? `step:${m.step.name}`
+        : m.type === 'stream_event' ? `delta:${m.event.delta.text}`
+          : `result:${m.result}`
+  )), [
+    'delta:Only used here.',
+    'segment:Only used here.',
+    'step:Edit',
+    'delta:Now the dialog.',
+    'segment:Now the dialog.',
+    'result:Now the dialog.',
+  ]);
+  assert.equal(result.stdout, 'Now the dialog.');
+});
+
+// Closing a block resets the buffer for the next one, so the fallback has to
+// bank what it closed — otherwise a turn whose result carries no text would
+// resolve to just its last block, silently losing everything before it.
+test('claude sdk executor: a result with no text still resolves to every block the turn wrote', async () => {
+  const { createClaudeSdkExecutor } = await load();
+  const delta = (text) => ({ type: 'stream_event', session_id: 's1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text } } });
+  const queryFn = ({ prompt }) => {
+    const gen = (async function* () {
+      for await (const _input of prompt) {
+        yield delta('First block. ');
+        yield { type: 'assistant', session_id: 's1', message: { role: 'assistant', content: [{ type: 'text', text: 'First block. ' }] } };
+        yield delta('Second block.');
+        yield { type: 'assistant', session_id: 's1', message: { role: 'assistant', content: [{ type: 'text', text: 'Second block.' }] } };
+        yield { type: 'result', subtype: 'success', result: null, session_id: 's1' };
+      }
+    })();
+    gen.interrupt = async () => {};
+    return gen;
+  };
+  const ex = createClaudeSdkExecutor({ queryFn });
+  const result = await ex.run({ cwd: '/tmp', prompt: 'x', sessionKey: 'silo-segment-2', onData: () => {} });
+  assert.equal(result.stdout, 'First block. Second block.');
+});
+
 test('summarizeToolInput: one short line from the first useful key, never the whole input', async () => {
   const { summarizeToolInput } = await load();
   assert.equal(summarizeToolInput({ file_path: 'a/b.ts', old_string: 'secret' }), 'a/b.ts');

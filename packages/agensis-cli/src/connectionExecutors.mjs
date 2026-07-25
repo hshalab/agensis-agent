@@ -126,6 +126,15 @@ function encodeStreamJsonResult(result) {
 function encodeAgensisStep(step) {
   return `${JSON.stringify({ type: "agensis_step", step })}\n`;
 }
+// A finished assistant TEXT block. Without it every text the model wrote in a
+// turn was concatenated into one ever-growing placeholder message, so five
+// separate thoughts ran together in one bubble and the human had no boundary to
+// read or interrupt at. A segment closes the current message with its own
+// complete text; the server then opens the next placeholder, so the transcript
+// becomes text, tool chips, text — the order the model actually produced.
+function encodeAgensisSegment(segment) {
+  return `${JSON.stringify({ type: "agensis_segment", segment })}\n`;
+}
 
 const TOOL_DETAIL_KEYS = ["file_path", "path", "pattern", "command", "description", "prompt"];
 const TOOL_DETAIL_MAX = 120;
@@ -248,20 +257,34 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
             }
           } else if (message.type === "result") {
             if (message.subtype === "success") {
-              const result = message.result == null ? turn.streamed : String(message.result);
+              const result = message.result == null ? turn.text : String(message.result);
               turn.onData?.(encodeStreamJsonResult(result));
               turn.finish({ status: 0, stdout: result, stderr: "", error: null });
             } else {
               const detail = Array.isArray(message.errors) ? message.errors.filter(Boolean).join("\n") : message.result;
               const error = new Error(detail || `claude-agent-sdk result error: ${message.subtype}`);
-              turn.finish({ status: 1, stdout: turn.streamed, stderr: error.message, error });
+              turn.finish({ status: 1, stdout: turn.text, stderr: error.message, error });
             }
           } else if (message.type === "assistant") {
-            // ONLY tool_use blocks are taken from assistant messages: the reply
-            // text already arrived as stream_event text_deltas above, so reading
-            // it again here would double every answer.
+            // An assistant message is a COMPLETED block of the turn: its text
+            // (already streamed above as deltas) is done, and the tool_use blocks
+            // beside it are what that text just announced. The segment is emitted
+            // FIRST so the transcript keeps the model's own order — text, then
+            // the tools it called — and the text is never re-emitted as deltas,
+            // which would double every answer.
             const content = message.message?.content;
             if (Array.isArray(content)) {
+              const text = content
+                .filter((block) => block && block.type === "text" && typeof block.text === "string")
+                .map((block) => block.text)
+                .join("");
+              if (text) {
+                turn.onData?.(encodeAgensisSegment({ text }));
+                // Block closed: bank what it streamed and restart the buffer so
+                // the next block begins empty instead of replaying this one.
+                turn.flushed += turn.streamed;
+                turn.streamed = "";
+              }
               for (const block of content) {
                 if (!block || block.type !== "tool_use" || !block.name) continue;
                 turn.onData?.(encodeAgensisStep({
@@ -285,7 +308,7 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
         if (session.activeTurn) {
           session.activeTurn.finish({
             status: null,
-            stdout: session.activeTurn.streamed,
+            stdout: session.activeTurn.text,
             stderr: String(terminalError?.message || terminalError || ""),
             error: terminalError,
           });
@@ -314,7 +337,10 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
       let settled = false;
       let timer = null;
       const turn = {
-        streamed: "",
+        streamed: "", // tokens of the block being written; reset at each segment
+        flushed: "", // tokens of the blocks already closed by a segment
+        // Every fallback wants the whole turn, not just the open block.
+        get text() { return this.flushed + this.streamed; },
         onData,
         finish(value) {
           if (settled) return;
@@ -326,7 +352,7 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
         },
       };
       const onAbort = () => {
-        const value = { status: null, stdout: turn.streamed, stderr: "", aborted: true, error: new Error("cancelled") };
+        const value = { status: null, stdout: turn.text, stderr: "", aborted: true, error: new Error("cancelled") };
         Promise.resolve(session.query.interrupt?.()).catch(() => {});
         closeSession(sessionKey, session, value);
       };
@@ -336,7 +362,7 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
         timer = setTimeout(() => {
           const error = new Error(`timed out after ${timeoutMs}ms`);
           Promise.resolve(session.query.interrupt?.()).catch(() => {});
-          closeSession(sessionKey, session, { status: null, stdout: turn.streamed, stderr: error.message, error });
+          closeSession(sessionKey, session, { status: null, stdout: turn.text, stderr: error.message, error });
         }, timeoutMs);
         timer.unref?.();
       }

@@ -184,3 +184,99 @@ test('daemon emits an agent_job_step frame per tool round trip', { timeout: 20_0
     await fs.rm(tempDir, { recursive: true, force: true });
   }
 });
+
+// The segment frame is what breaks a turn into readable steps. Before it, every
+// text block of a turn was appended to ONE placeholder message, so five separate
+// thoughts arrived as a single run-on bubble the human could not steer between.
+// This pins the exact object the server parses — field names included.
+test('daemon emits an agent_job_segment frame per completed text block', { timeout: 20_000 }, async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agensis-segment-'));
+  const fakeCli = path.join(tempDir, 'claude.mjs');
+  // A real two-block turn: text, the tool that text announced, then more text.
+  const stream = [
+    { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Reading it.' } } },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'Reading it.' }, { type: 'tool_use', id: 'tu_1', name: 'Read', input: { file_path: 'src/App.tsx' } }] } },
+    { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Read it.' } } },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'Read it.' }] } },
+    { type: 'result', subtype: 'success', result: 'Read it.' },
+  ].map((o) => JSON.stringify(o)).join('\n');
+  await fs.writeFile(fakeCli, `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(`${stream}\n`)});\n`, { mode: 0o700 });
+
+  const server = new WebSocket.Server({ host: '::1', port: 0 });
+  await new Promise((resolve, reject) => {
+    server.once('listening', resolve);
+    server.once('error', reject);
+  });
+  const port = server.address().port;
+  const frames = [];
+  let child;
+
+  try {
+    const resultFrame = new Promise((resolve, reject) => {
+      server.once('connection', (socket) => {
+        socket.on('message', (raw) => {
+          const frame = JSON.parse(String(raw));
+          frames.push(frame);
+          if (frame.action === 'agent_register') {
+            socket.send(JSON.stringify({ type: 'agent_registered', connection: { name: 'segment-agent', host: 'test-host' } }));
+            socket.send(JSON.stringify({
+              type: 'agent_job',
+              job: {
+                id: 'job-segment',
+                workspaceId: 'workspace-segment',
+                sessionId: 'session-segment',
+                prompt: 'Read the file.',
+                agent: { model: 'claude-opus-4-8', permission_mode: 'default', run_mode: 'daemon' },
+              },
+            }));
+          }
+          if (frame.action === 'agent_job_result') resolve(frame);
+        });
+        socket.once('error', reject);
+      });
+    });
+
+    child = spawn(process.execPath, [
+      'packages/agensis-cli/bin/agensis.mjs',
+      'connect',
+      '--url', `http://[::1]:${port}`,
+      '--token', 'aga_segment_token',
+      '--workspace', 'workspace-segment',
+      '--agent', 'agent-segment',
+      '--handle', 'segment-agent',
+      '--cwd', tempDir,
+      '--coding-cmd', `${fakeCli} -p`,
+      '--heartbeat-ms', '1000',
+      '--once',
+    ], {
+      cwd: path.resolve(__dirname, '..'),
+      env: { ...process.env, HOME: tempDir },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const childExit = new Promise((resolve, reject) => {
+      child.once('exit', resolve);
+      child.once('error', reject);
+    });
+
+    await resultFrame;
+    const segments = frames.filter((frame) => frame.action === 'agent_job_segment');
+    assert.deepEqual(
+      segments.map((frame) => frame.text),
+      ['Reading it.', 'Read it.'],
+      `expected one segment per text block, got ${JSON.stringify(segments)}`,
+    );
+    const [first] = segments;
+    assert.equal(first.jobId, 'job-segment');
+    assert.equal(typeof first.elapsedMs, 'number');
+    // Text before the tools it announced, or the transcript reads backwards.
+    assert.ok(
+      frames.indexOf(first) < frames.findIndex((frame) => frame.action === 'agent_job_step'),
+      'the segment closing a block must be sent before that block’s step frames',
+    );
+    await childExit;
+  } finally {
+    if (child?.exitCode == null) child?.kill('SIGTERM');
+    await new Promise((resolve) => server.close(resolve));
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
