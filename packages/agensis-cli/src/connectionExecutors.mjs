@@ -118,6 +118,30 @@ function encodeStreamJsonDelta(text) {
 function encodeStreamJsonResult(result) {
   return `${JSON.stringify({ type: "result", result })}\n`;
 }
+// Tool activity has no text, so a tool-only turn (read/grep/bash/subagent —
+// most of what the agent actually does) produced ZERO deltas and left the chat
+// sitting on "Thinking …" in silence. Steps ride the same onData channel as
+// their own NDJSON line; createStreamJsonParser (agensis.mjs) routes them to
+// onStep instead of into the reply text.
+function encodeAgensisStep(step) {
+  return `${JSON.stringify({ type: "agensis_step", step })}\n`;
+}
+
+const TOOL_DETAIL_KEYS = ["file_path", "path", "pattern", "command", "description", "prompt"];
+const TOOL_DETAIL_MAX = 120;
+
+/** Short single-line summary of a tool_use input — never the whole input object. */
+export function summarizeToolInput(input) {
+  if (!input || typeof input !== "object") return "";
+  for (const key of TOOL_DETAIL_KEYS) {
+    const value = input[key];
+    if (typeof value !== "string") continue;
+    const line = value.replace(/\s+/g, " ").trim();
+    if (!line) continue;
+    return line.length > TOOL_DETAIL_MAX ? `${line.slice(0, TOOL_DETAIL_MAX)}…` : line;
+  }
+  return "";
+}
 
 function connectionFingerprint(opts) {
   return JSON.stringify({
@@ -231,6 +255,21 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
               const detail = Array.isArray(message.errors) ? message.errors.filter(Boolean).join("\n") : message.result;
               const error = new Error(detail || `claude-agent-sdk result error: ${message.subtype}`);
               turn.finish({ status: 1, stdout: turn.streamed, stderr: error.message, error });
+            }
+          } else if (message.type === "assistant") {
+            // ONLY tool_use blocks are taken from assistant messages: the reply
+            // text already arrived as stream_event text_deltas above, so reading
+            // it again here would double every answer.
+            const content = message.message?.content;
+            if (Array.isArray(content)) {
+              for (const block of content) {
+                if (!block || block.type !== "tool_use" || !block.name) continue;
+                turn.onData?.(encodeAgensisStep({
+                  kind: "tool",
+                  name: String(block.name),
+                  detail: summarizeToolInput(block.input),
+                }));
+              }
             }
           }
         }

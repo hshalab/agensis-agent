@@ -94,3 +94,93 @@ test('daemon honors the hub auth, register, job, delta, and result contract', { 
     await fs.rm(tempDir, { recursive: true, force: true });
   }
 });
+
+// The step frame is what makes a working agent visible. Before it, a turn that
+// only read files / ran commands produced no text, so no agent_job_delta, and
+// the chat sat on "Thinking …" until the whole job finished. This pins the exact
+// object the server parses — field names included.
+test('daemon emits an agent_job_step frame per tool round trip', { timeout: 20_000 }, async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agensis-step-'));
+  // Named claude.* so the daemon treats it as Claude and adds --output-format
+  // stream-json; the script replays the NDJSON a real tool-using turn produces.
+  const fakeCli = path.join(tempDir, 'claude.mjs');
+  const stream = [
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu_1', name: 'Read', input: { file_path: 'src/App.tsx' } }] } },
+    { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Read it.' } } },
+    { type: 'result', subtype: 'success', result: 'Read it.' },
+  ].map((o) => JSON.stringify(o)).join('\n');
+  await fs.writeFile(fakeCli, `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(`${stream}\n`)});\n`, { mode: 0o700 });
+
+  const server = new WebSocket.Server({ host: '::1', port: 0 });
+  await new Promise((resolve, reject) => {
+    server.once('listening', resolve);
+    server.once('error', reject);
+  });
+  const port = server.address().port;
+  const frames = [];
+  let child;
+
+  try {
+    const resultFrame = new Promise((resolve, reject) => {
+      server.once('connection', (socket) => {
+        socket.on('message', (raw) => {
+          const frame = JSON.parse(String(raw));
+          frames.push(frame);
+          if (frame.action === 'agent_register') {
+            socket.send(JSON.stringify({ type: 'agent_registered', connection: { name: 'step-agent', host: 'test-host' } }));
+            socket.send(JSON.stringify({
+              type: 'agent_job',
+              job: {
+                id: 'job-step',
+                workspaceId: 'workspace-step',
+                sessionId: 'session-step',
+                prompt: 'Read the file.',
+                agent: { model: 'claude-opus-4-8', permission_mode: 'default', run_mode: 'daemon' },
+              },
+            }));
+          }
+          if (frame.action === 'agent_job_result') resolve(frame);
+        });
+        socket.once('error', reject);
+      });
+    });
+
+    child = spawn(process.execPath, [
+      'packages/agensis-cli/bin/agensis.mjs',
+      'connect',
+      '--url', `http://[::1]:${port}`,
+      '--token', 'aga_step_token',
+      '--workspace', 'workspace-step',
+      '--agent', 'agent-step',
+      '--handle', 'step-agent',
+      '--cwd', tempDir,
+      '--coding-cmd', `${fakeCli} -p`,
+      '--heartbeat-ms', '1000',
+      '--once',
+    ], {
+      cwd: path.resolve(__dirname, '..'),
+      env: { ...process.env, HOME: tempDir },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const childExit = new Promise((resolve, reject) => {
+      child.once('exit', resolve);
+      child.once('error', reject);
+    });
+
+    const result = await resultFrame;
+    assert.equal(result.response, 'Read it.');
+    const steps = frames.filter((frame) => frame.action === 'agent_job_step');
+    assert.equal(steps.length, 1, `expected exactly one step frame, got ${JSON.stringify(steps)}`);
+    const [step] = steps;
+    assert.equal(step.jobId, 'job-step');
+    assert.equal(step.kind, 'tool');
+    assert.equal(step.name, 'Read');
+    assert.equal(step.detail, 'src/App.tsx');
+    assert.equal(typeof step.elapsedMs, 'number');
+    await childExit;
+  } finally {
+    if (child?.exitCode == null) child?.kill('SIGTERM');
+    await new Promise((resolve) => server.close(resolve));
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});

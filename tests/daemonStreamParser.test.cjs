@@ -79,3 +79,69 @@ test('ignores non-JSON noise on the stream', () => {
   p.feed(JSON.stringify({ delta: { type: 'text_delta', text: 'ok' } }) + '\n');
   assert.equal(p.live, 'ok');
 });
+
+// Steps are progress metadata, not reply content. They must reach onStep and
+// must never contribute to live/result — otherwise "Read src/App.tsx" would be
+// spoken back to the human as part of the agent's answer.
+test('raises an agensis_step line as a step without touching the reply text', () => {
+  const steps = [];
+  const p = createStreamJsonParser({ onStep: (s) => steps.push(s) });
+  p.feed(lines(
+    { delta: { type: 'text_delta', text: 'Looking' } },
+    { type: 'agensis_step', step: { kind: 'tool', name: 'Read', detail: 'src/App.tsx' } },
+    { delta: { type: 'text_delta', text: ' now' } },
+    { type: 'result', subtype: 'success', result: 'Looking now' },
+  ));
+  p.end();
+  assert.deepEqual(steps, [{ kind: 'tool', name: 'Read', detail: 'src/App.tsx' }]);
+  assert.equal(p.live, 'Looking now');
+  assert.equal(p.result, 'Looking now');
+});
+
+// The LocalExecutor path is raw `claude --output-format stream-json`, where tool
+// calls arrive as tool_use blocks on assistant messages.
+test('raises a step per tool_use block on a raw assistant message', () => {
+  const steps = [];
+  const p = createStreamJsonParser({ onStep: (s) => steps.push(s) });
+  p.feed(lines({
+    type: 'assistant',
+    message: {
+      content: [
+        { type: 'text', text: 'On it.' },
+        { type: 'tool_use', id: 'tu_1', name: 'Grep', input: { pattern: 'TODO' } },
+      ],
+    },
+  }));
+  p.end();
+  assert.deepEqual(steps, [{ kind: 'tool', name: 'Grep', detail: 'TODO' }]);
+  assert.equal(p.result, 'On it.'); // the tool call did not become reply text
+});
+
+test('does not report the same tool_use id twice if the assistant message repeats', () => {
+  const steps = [];
+  const p = createStreamJsonParser({ onStep: (s) => steps.push(s) });
+  const message = { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu_1', name: 'Read', input: { file_path: 'a.ts' } }] } };
+  p.feed(lines(message, message));
+  assert.equal(steps.length, 1);
+});
+
+// Both executors can feed this parser; a tool call must be reported ONCE.
+test('ignores raw assistant tool_use once the pooled executor has sent agensis_step lines', () => {
+  const steps = [];
+  const p = createStreamJsonParser({ onStep: (s) => steps.push(s) });
+  p.feed(lines(
+    { type: 'agensis_step', step: { kind: 'tool', name: 'Read', detail: 'a.ts' } },
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu_1', name: 'Read', input: { file_path: 'a.ts' } }] } },
+  ));
+  assert.deepEqual(steps, [{ kind: 'tool', name: 'Read', detail: 'a.ts' }]);
+});
+
+test('parses normally when no onStep callback is supplied', () => {
+  const p = createStreamJsonParser();
+  p.feed(lines(
+    { type: 'agensis_step', step: { kind: 'tool', name: 'Read', detail: 'a.ts' } },
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu_1', name: 'Bash', input: { command: 'ls' } }, { type: 'text', text: 'hi' }] } },
+  ));
+  p.end();
+  assert.equal(p.result, 'hi');
+});

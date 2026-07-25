@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import process from "node:process";
 import WebSocket from "ws";
 import { createExecutor } from "./executor.mjs";
+import { summarizeToolInput } from "./connectionExecutors.mjs";
 import { createQueue } from "./queue.mjs";
 import { startCursorBuddyLocalBridge } from "./cursorbuddyLocalBridge.mjs";
 import { deriveMemoryRoot, snapshotMemory, memoryFingerprint } from "./memory.mjs";
@@ -29,7 +30,7 @@ const DEFAULT_HEARTBEAT_MS = 15 * 1000;
 const DEFAULT_MAX_CONCURRENCY = 2;
 const LEAN_PROMPT_MAX_BYTES = 10 * 1024;
 const DEFAULT_MODEL = "claude-opus-4-8";
-export const AGENSIS_CLI_VERSION = "0.1.28";
+export const AGENSIS_CLI_VERSION = "0.1.29";
 
 export async function runAgensisDaemon(rawConfig = {}) {
   const config = normalizeConfig(rawConfig);
@@ -847,8 +848,21 @@ async function runAgentJob(config, job, { signal }) {
     });
   };
 
+  // One message per tool round trip, so a tool-only turn is visible as it
+  // happens instead of silently expanding a single "Thinking …" placeholder.
+  const sendStep = (step) => {
+    send(job.ws, {
+      action: "agent_job_step",
+      jobId: job.id,
+      kind: step.kind,
+      name: step.name,
+      detail: step.detail,
+      elapsedMs: Date.now() - started,
+    });
+  };
+
   sendDelta("");
-  const parser = command.streamJson ? createStreamJsonParser() : null;
+  const parser = command.streamJson ? createStreamJsonParser({ onStep: sendStep }) : null;
   const progressTimer = setInterval(() => sendDelta(fullContent), 1000);
   if (progressTimer.unref) progressTimer.unref();
 
@@ -1134,15 +1148,39 @@ function leanMcpRuntime(config) {
 // `result` event. Robust to both the partial-message wrapping (event.delta)
 // and bare delta shapes, and falls back to complete `assistant` messages when
 // partial messages aren't present.
-function createStreamJsonParser() {
+// Tool activity (`kind: "tool"` steps) is progress metadata, not reply content:
+// it is raised through onStep and never contributes to live/result, so a step
+// can never leak into what the human reads as the agent's answer.
+function createStreamJsonParser({ onStep } = {}) {
   let buffer = "";
   let streamed = ""; // accumulated text_delta tokens (live view)
   let sawDelta = false;
   let assistantText = ""; // fallback when no token-level deltas arrive
   let finalResult = null; // authoritative text from the `result` event
+  let sawAgensisStep = false; // pooled executor already reported this stream's tools
+  const seenToolIds = new Set();
+
+  const raiseStep = (step) => {
+    if (typeof onStep !== "function" || !step.name) return;
+    try {
+      onStep(step);
+    } catch {
+      /* a failed progress send must never break parsing the reply */
+    }
+  };
 
   const handleEvent = (evt) => {
     if (!evt || typeof evt !== "object") return;
+    // Emitted by the pooled SDK executor (connectionExecutors.mjs), which has no
+    // raw NDJSON of its own to forward.
+    if (evt.type === "agensis_step") {
+      const step = evt.step;
+      if (step && typeof step === "object") {
+        sawAgensisStep = true;
+        raiseStep({ kind: step.kind || "tool", name: String(step.name || ""), detail: String(step.detail || "") });
+      }
+      return;
+    }
     const delta = (evt.event && evt.event.delta) || evt.delta;
     if (delta && delta.type === "text_delta" && typeof delta.text === "string") {
       sawDelta = true;
@@ -1159,6 +1197,21 @@ function createStreamJsonParser() {
         .map((b) => b.text)
         .join("");
       if (text) assistantText += text;
+      // The LocalExecutor path is raw `claude --output-format stream-json`, where
+      // tool calls arrive as tool_use blocks on assistant messages — same steps,
+      // same wire, so both executors behave identically. Skipped once the pooled
+      // executor has sent agensis_step lines, so one tool call is reported once.
+      if (!sawAgensisStep) {
+        for (const block of evt.message.content) {
+          if (!block || block.type !== "tool_use") continue;
+          const id = typeof block.id === "string" ? block.id : "";
+          if (id) {
+            if (seenToolIds.has(id)) continue;
+            seenToolIds.add(id);
+          }
+          raiseStep({ kind: "tool", name: String(block.name || ""), detail: summarizeToolInput(block.input) });
+        }
+      }
     }
   };
 

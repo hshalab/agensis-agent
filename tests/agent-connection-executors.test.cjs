@@ -326,3 +326,77 @@ test('claude sdk executor: still auto-allows the agensis MCP tools under yolo', 
   assert.ok(seen.allowedTools.includes('mcp__agensis'));
   assert.equal(seen.permissionMode, 'bypassPermissions');
 });
+
+// Tool-only turns used to be invisible: the pump handled ONLY stream_event text
+// deltas and result, so while the agent read files, grepped, ran bash or spawned
+// subagents no text existed, no delta was sent, and the chat sat on "Thinking …"
+// in silence. tool_use blocks live on assistant messages, which were ignored.
+test('claude sdk executor: emits one agensis_step per tool_use block without duplicating reply text', async () => {
+  const { createClaudeSdkExecutor } = await load();
+  const queryFn = ({ prompt }) => {
+    const gen = (async function* () {
+      for await (const _input of prompt) {
+        yield {
+          type: 'assistant',
+          session_id: 's1',
+          message: {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: 'Let me look.' },
+              { type: 'tool_use', id: 'tu_1', name: 'Read', input: { file_path: 'src/App.tsx' } },
+              { type: 'tool_use', id: 'tu_2', name: 'Bash', input: { command: 'npm test\n--watch=false' } },
+            ],
+          },
+        };
+        yield { type: 'stream_event', session_id: 's1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Done.' } } };
+        yield { type: 'result', subtype: 'success', result: 'Done.', session_id: 's1' };
+      }
+    })();
+    gen.interrupt = async () => {};
+    return gen;
+  };
+  const ex = createClaudeSdkExecutor({ queryFn });
+
+  const lines = [];
+  const result = await ex.run({ cwd: '/tmp', prompt: 'check it', sessionKey: 'silo-step', onData: (c) => lines.push(c) });
+  const parsed = lines.map((l) => JSON.parse(l.trim()));
+
+  assert.deepEqual(parsed.filter((m) => m.type === 'agensis_step').map((m) => m.step), [
+    { kind: 'tool', name: 'Read', detail: 'src/App.tsx' },
+    { kind: 'tool', name: 'Bash', detail: 'npm test --watch=false' },
+  ]);
+  // The assistant message's own text must NOT be re-emitted as a delta — it
+  // already arrived via stream_event, and doubling it would double the reply.
+  assert.deepEqual(parsed.filter((m) => m.type === 'stream_event').map((m) => m.event.delta.text), ['Done.']);
+  assert.equal(result.stdout, 'Done.');
+});
+
+test('claude sdk executor: tool_use with no summarizable input still reports the tool name', async () => {
+  const { createClaudeSdkExecutor } = await load();
+  const queryFn = ({ prompt }) => {
+    const gen = (async function* () {
+      for await (const _input of prompt) {
+        yield { type: 'assistant', session_id: 's1', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_1', name: 'TodoWrite' }] } };
+        yield { type: 'assistant', session_id: 's1', message: { role: 'assistant', content: 'not an array' } };
+        yield { type: 'result', subtype: 'success', result: 'ok', session_id: 's1' };
+      }
+    })();
+    gen.interrupt = async () => {};
+    return gen;
+  };
+  const ex = createClaudeSdkExecutor({ queryFn });
+  const lines = [];
+  await ex.run({ cwd: '/tmp', prompt: 'x', sessionKey: 'silo-step-2', onData: (c) => lines.push(c) });
+  const steps = lines.map((l) => JSON.parse(l.trim())).filter((m) => m.type === 'agensis_step');
+  assert.deepEqual(steps.map((m) => m.step), [{ kind: 'tool', name: 'TodoWrite', detail: '' }]);
+});
+
+test('summarizeToolInput: one short line from the first useful key, never the whole input', async () => {
+  const { summarizeToolInput } = await load();
+  assert.equal(summarizeToolInput({ file_path: 'a/b.ts', old_string: 'secret' }), 'a/b.ts');
+  assert.equal(summarizeToolInput({ pattern: 'TODO', path: 'src' }), 'src'); // path outranks pattern
+  assert.equal(summarizeToolInput({ prompt: 'line one\nline two' }), 'line one line two');
+  assert.equal(summarizeToolInput({}), '');
+  assert.equal(summarizeToolInput(undefined), '');
+  assert.equal(summarizeToolInput({ command: 'x'.repeat(500) }).length, 121); // 120 chars + ellipsis
+});

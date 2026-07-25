@@ -1,6 +1,6 @@
 {
   "name": "agensis-agent-monorepo",
-  "version": "0.1.28",
+  "version": "0.1.29",
   "private": true,
   "description": "Open-source local agent daemon for Agensis workspaces",
   "workspaces": [
