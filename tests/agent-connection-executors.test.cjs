@@ -288,3 +288,41 @@ test('claude sdk executor: timeout closes the session so late output cannot leak
   assert.match(timedOut.error.message, /timed out/);
   assert.equal(callCount, 1);
 });
+
+// The workspace's own MCP tools must be auto-approved in EVERY permission mode.
+//
+// Regression this pins: @scout on a remote VM had the agensis MCP connected and
+// its tool schemas loaded, yet every mcp__agensis__create_task call came back
+// "you haven't granted it yet". The daemon passed no allowedTools, so in the
+// default permission mode the SDK asked for approval — and a headless daemon has
+// nobody to ask. It could not be fixed with a settings file either: lean mode
+// (the default) passes settingSources: [], so settings.local.json is never read
+// and grants written there are silently ignored.
+test('claude sdk executor: auto-allows the agensis MCP tools in the default permission mode', async () => {
+  const { createClaudeSdkExecutor } = await load();
+  let seen = null;
+  const { queryFn } = fakeClaudeQuery({});
+  const wrapped = (args) => { seen = args.options; return queryFn(args); };
+  const ex = createClaudeSdkExecutor({ queryFn: wrapped });
+  await ex.run({ cwd: '/tmp', prompt: 'hi', permissionMode: 'default' });
+
+  assert.ok(Array.isArray(seen.allowedTools), 'allowedTools must be passed to the SDK');
+  assert.ok(
+    seen.allowedTools.includes('mcp__agensis'),
+    `expected the agensis MCP server to be auto-allowed, got ${JSON.stringify(seen.allowedTools)}`,
+  );
+  // It is an exemption, not a restriction — the SDK documents `tools` for that.
+  // If this ever becomes the whole tool set, the agent loses Read/Write/Bash.
+  assert.equal(seen.tools, undefined, 'must not restrict the available tool set');
+  assert.equal(seen.permissionMode, 'default', 'permission mode itself is unchanged');
+});
+
+test('claude sdk executor: still auto-allows the agensis MCP tools under yolo', async () => {
+  const { createClaudeSdkExecutor } = await load();
+  let seen = null;
+  const { queryFn } = fakeClaudeQuery({});
+  const ex = createClaudeSdkExecutor({ queryFn: (args) => { seen = args.options; return queryFn(args); } });
+  await ex.run({ cwd: '/tmp', prompt: 'hi', permissionMode: 'yolo' });
+  assert.ok(seen.allowedTools.includes('mcp__agensis'));
+  assert.equal(seen.permissionMode, 'bypassPermissions');
+});

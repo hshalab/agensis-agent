@@ -74,6 +74,24 @@ function createKeyedMutex() {
   };
 }
 
+// The workspace's OWN MCP tools are never permission-gated.
+//
+// An agent connected to a workspace IS a member of it — asking a human to
+// approve @scout calling create_task in the workspace it already belongs to is
+// a prompt nobody can answer, because the daemon runs headless on someone
+// else's machine. Without this the tools resolve, the call reaches the
+// permission layer, and it is denied with "you haven't granted it yet".
+//
+// This CANNOT be solved with a settings file: lean mode (the default, see
+// agensis.mjs `leanCli`) passes `settingSources: []` below, so the SDK reads no
+// settings.local.json at all — grants written there are silently ignored, and
+// restarting changes nothing. It also cannot be solved by permissionMode alone:
+// 'acceptEdits' only covers file edits, leaving bypassPermissions ('yolo') as
+// the only working option, which hands over unrestricted shell to get a task
+// created. Allow-listing the server prefix grants exactly the workspace tools
+// and nothing else.
+const AGENSIS_MCP_ALLOWED_TOOLS = ["mcp__agensis"];
+
 function mapClaudePermission(permissionMode) {
   if (permissionMode === "yolo") return { permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true };
   if (permissionMode === "accept_edits") return { permissionMode: "acceptEdits" };
@@ -163,6 +181,8 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
         cwd: opts.cwd,
         model: opts.model,
         ...permission,
+        // Always allowed, in every permission mode — see AGENSIS_MCP_ALLOWED_TOOLS.
+        allowedTools: AGENSIS_MCP_ALLOWED_TOOLS,
         additionalDirectories: opts.hostFolders && opts.hostFolders.length ? opts.hostFolders : undefined,
         mcpServers,
         strictMcpConfig: opts.leanCli ? true : undefined,
