@@ -16,6 +16,8 @@ import {
   writeHeartbeatFile,
   writeHeartbeatFileSync,
   readAgentStatus,
+  readAgentIdentity,
+  identityFilePath,
   statusFilePath,
   ensureHeartbeatMd,
   heartbeatMdPath,
@@ -262,13 +264,20 @@ export async function runAgensisDaemon(rawConfig = {}) {
     log(`Connecting to ${url.replace(config.token, "redacted")}`);
     ws = new WebSocket(url);
 
-    ws.on("open", () => {
+    ws.on("open", async () => {
       socketRegistered = false;
       registeredConnection = null;
       log(`Connected. Registering @${config.handle || "agent"} from ${config.cwd}`);
       // F14: authenticate via a first frame so the aga_ token never rides the WS
       // URL query (proxy/access logs). Server path (2) verifies agent tokens here.
       send(ws, { type: "auth", token: config.token });
+      // Self-declared identity from the operator/agent-owned identity.json, read
+      // fresh on EVERY connect so edits land on the next reconnect. Missing or
+      // malformed file = no identity key at all, exactly the old frame. The server
+      // (applyAgentIdentity) is the enforcement point: it caps fields, ignores
+      // `name` for existing agents, and lets a human's explicit choice win — so
+      // declaring on every connect is safe by design.
+      const identity = await readAgentIdentity(config);
       send(ws, {
         action: "agent_register",
         workspaceId: config.workspace,
@@ -277,6 +286,7 @@ export async function runAgensisDaemon(rawConfig = {}) {
         name: config.name,
         host: os.hostname(),
         cwd: config.cwd,
+        ...(identity ? { identity } : {}),
         metadata: {
           codingCmd: config.codingCmd,
           model: config.model,
@@ -988,6 +998,7 @@ async function buildPrompt(config, job) {
     skills ? `Enabled skills:\n${skills}` : "",
     'Thread widgets: this chat has a right-side widget rail the human watches. When you work a multi-step task here, surface it: call create_thread_item (kind "todo", "plan", or "blocker") with the Channel session id above to post your plan steps and to-dos, mark them done with update_thread_item as you finish, and raise a "blocker" when you need the human to answer something (read their reply from the item response via list_thread_items). Keep it to a few real items, not every micro-step; skip it for quick one-off replies.',
     `Status file: you can report your own working status by overwriting the JSON file at ${statusFilePath(config)} with e.g. {"status":"working","note":"short summary of what you're doing"}. Your daemon reads it on its next heartbeat (~${Math.round((config.heartbeatMs || 15000) / 1000)}s) and surfaces it on your agent card. Optional and best-effort — overwrite the whole file, keep note under ~200 chars, and there's no need to clear it.`,
+    `Identity file: you can declare how you appear — avatar, description, soul, and voice ({"cartesia_voice_id","speed","emotion"}) — by writing JSON to ${identityFilePath(config)}, e.g. {"avatar":"FX","description":"...","voice":{"emotion":"calm"}}. Your daemon sends it the next time it connects; anything a human has set in the app always wins, and "name" only applies to brand-new agents.`,
     heartbeatSection,
     "User message:",
     String(job.prompt || ""),

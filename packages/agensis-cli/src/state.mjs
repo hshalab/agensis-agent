@@ -13,6 +13,11 @@
 //                     report its own status; the daemon reads it each beat and folds it
 //                     into the heartbeat it sends up. The daemon NEVER writes this file,
 //                     so there is no self-write feedback loop.
+//   identity.json   — OPERATOR/AGENT-OWNED self-declared identity (avatar, description,
+//                     soul, voice…). Read fresh on every connect and sent as `identity`
+//                     on agent_register; the daemon NEVER writes it (agent.json is
+//                     daemon-owned and rewritten wholesale on every register, so this
+//                     lives in its own file). Absent or malformed = nothing is sent.
 //   update-request.json — AGENT-OWNED trigger. The coding subprocess writes this to ask
 //                     the supervisor (see selfUpdate.mjs) to update+reload the daemon's
 //                     own connection. The supervisor clears it once picked up, so it is
@@ -31,6 +36,7 @@ import os from "node:os";
 import path from "node:path";
 
 const STATUS_FILE = "status.json";
+const IDENTITY_FILE = "identity.json";
 const HEARTBEAT_FILE = "heartbeat.json";
 const HEARTBEAT_MD_FILE = "heartbeat.md";
 const AGENT_FILE = "agent.json";
@@ -239,6 +245,71 @@ function clampField(value) {
   if (value == null) return "";
   const text = String(value).trim().replace(/\s+/g, " ");
   return text.slice(0, MAX_STATUS_FIELD);
+}
+
+// Cap so a runaway identity.json edit can't ship a giant blob on every reconnect. The
+// server bounds each field far tighter (shared/agentIdentity.cjs FIELD_LIMITS); this
+// only bounds the file read, deliberately NOT duplicating those caps.
+const MAX_IDENTITY_BYTES = 16 * 1024;
+
+// The fields the server's normalizeIdentityDeclaration understands. This is a
+// shape-only filter: lengths, the colour format, the emotion whitelist and the
+// human-set precedence rule are all enforced server-side.
+const IDENTITY_TEXT_FIELDS = ["name", "avatar", "accent_color", "description", "soul"];
+const IDENTITY_VOICE_FIELDS = ["cartesia_voice_id", "voice_id", "id", "speed", "emotion", "attitude"];
+
+export function identityFilePath(config) {
+  return path.join(resolveStateDir(config), IDENTITY_FILE);
+}
+
+// Read the OPERATOR/AGENT-OWNED identity.json declaration. Returns a sparse object of
+// only the fields the server accepts, or null when the file is absent, unreadable, too
+// big, malformed, or carries nothing recognisable — in which case the register frame
+// simply has no identity key, exactly the pre-identity behaviour. Never throws: a
+// broken identity file must never be the reason a daemon cannot come online.
+export async function readAgentIdentity(config) {
+  const file = identityFilePath(config);
+  let raw;
+  try {
+    const stat = await fsp.stat(file);
+    if (!stat.isFile() || stat.size > MAX_IDENTITY_BYTES) return null;
+    raw = await fsp.readFile(file, "utf8");
+  } catch {
+    return null;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const out = {};
+  for (const field of IDENTITY_TEXT_FIELDS) {
+    // `profile` is a natural alias for description; the wire name stays canonical.
+    const value = field === "description" && parsed.description == null ? parsed.profile : parsed[field];
+    if (typeof value !== "string" || !value.trim()) continue;
+    out[field] = value.trim();
+  }
+  const voice = voiceShape(parsed.voice, parsed.attitude);
+  if (voice) out.voice = voice;
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+// Shape-only pass over the voice block. A top-level `attitude` folds into the voice —
+// the server only reads attitude as an alias of `voice.emotion`, never top-level.
+function voiceShape(rawVoice, topLevelAttitude) {
+  const source = rawVoice && typeof rawVoice === "object" && !Array.isArray(rawVoice) ? rawVoice : {};
+  const out = {};
+  for (const field of IDENTITY_VOICE_FIELDS) {
+    const value = source[field];
+    if (typeof value === "string" && value.trim()) out[field] = value.trim();
+    else if (field === "speed" && typeof value === "number" && Number.isFinite(value)) out.speed = value;
+  }
+  if (!out.emotion && !out.attitude && typeof topLevelAttitude === "string" && topLevelAttitude.trim()) {
+    out.attitude = topLevelAttitude.trim();
+  }
+  return Object.keys(out).length > 0 ? out : null;
 }
 
 export function updateRequestFilePath(config) {

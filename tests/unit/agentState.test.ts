@@ -9,6 +9,8 @@ import {
   writeHeartbeatFile,
   writeHeartbeatFileSync,
   readAgentStatus,
+  readAgentIdentity,
+  identityFilePath,
   ensureHeartbeatMd,
   heartbeatMdPath,
   readHeartbeatMd,
@@ -205,6 +207,85 @@ describe('readAgentStatus', () => {
   it('ignores an oversized status file', async () => {
     await writeStatus(JSON.stringify({ status: 'ok', pad: 'y'.repeat(9000) }));
     expect(await readAgentStatus(config)).toBeNull();
+  });
+});
+
+describe('identity.json (operator/agent-owned self-declared identity)', () => {
+  async function writeIdentity(contents: string) {
+    const dir = resolveStateDir(config);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, 'identity.json'), contents);
+  }
+
+  it('identityFilePath points into the state dir', () => {
+    expect(identityFilePath(config)).toBe(path.join(resolveStateDir(config), 'identity.json'));
+  });
+
+  it('returns null when the file is absent', async () => {
+    expect(await readAgentIdentity(config)).toBeNull();
+  });
+
+  it('passes through the fields the server accepts and drops unknown keys', async () => {
+    await writeIdentity(JSON.stringify({
+      name: 'Fox',
+      avatar: 'FX',
+      accent_color: '#ff6600',
+      description: 'A cunning coding agent',
+      soul: 'Be direct.',
+      voice: { cartesia_voice_id: 'voice-abc-12345', speed: 1.2, emotion: 'calm', junk: 'x' },
+      unrelated: 'dropped',
+    }));
+    expect(await readAgentIdentity(config)).toEqual({
+      name: 'Fox',
+      avatar: 'FX',
+      accent_color: '#ff6600',
+      description: 'A cunning coding agent',
+      soul: 'Be direct.',
+      voice: { cartesia_voice_id: 'voice-abc-12345', speed: 1.2, emotion: 'calm' },
+    });
+  });
+
+  it('accepts profile as an alias for description', async () => {
+    await writeIdentity(JSON.stringify({ profile: 'Reviewer of last resort' }));
+    expect(await readAgentIdentity(config)).toEqual({ description: 'Reviewer of last resort' });
+  });
+
+  it('folds a top-level attitude into the voice block', async () => {
+    await writeIdentity(JSON.stringify({ avatar: '🤖', attitude: 'sarcastic' }));
+    expect(await readAgentIdentity(config)).toEqual({ avatar: '🤖', voice: { attitude: 'sarcastic' } });
+  });
+
+  it('drops blank and non-string text fields without duplicating server caps', async () => {
+    await writeIdentity(JSON.stringify({
+      name: '   ',
+      avatar: 42,
+      description: 'kept even when very long '.repeat(40), // length caps are server-side
+      voice: 'not-an-object',
+    }));
+    const identity = await readAgentIdentity(config);
+    expect(identity?.description?.length).toBeGreaterThan(500);
+    expect(identity && 'name' in identity).toBe(false);
+    expect(identity && 'avatar' in identity).toBe(false);
+    expect(identity && 'voice' in identity).toBe(false);
+  });
+
+  it('keeps a string speed for the server to coerce', async () => {
+    await writeIdentity(JSON.stringify({ voice: { speed: '1.1' } }));
+    expect(await readAgentIdentity(config)).toEqual({ voice: { speed: '1.1' } });
+  });
+
+  it('returns null on malformed JSON, an array, or nothing recognisable', async () => {
+    await writeIdentity('{ not json');
+    expect(await readAgentIdentity(config)).toBeNull();
+    await writeIdentity('["nope"]');
+    expect(await readAgentIdentity(config)).toBeNull();
+    await writeIdentity(JSON.stringify({ unrelated: true, voice: {} }));
+    expect(await readAgentIdentity(config)).toBeNull();
+  });
+
+  it('ignores an oversized identity file', async () => {
+    await writeIdentity(JSON.stringify({ avatar: 'FX', pad: 'y'.repeat(17 * 1024) }));
+    expect(await readAgentIdentity(config)).toBeNull();
   });
 });
 

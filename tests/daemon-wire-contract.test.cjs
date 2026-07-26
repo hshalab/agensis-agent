@@ -13,6 +13,18 @@ test('daemon honors the hub auth, register, job, delta, and result contract', { 
   const fakeCli = path.join(tempDir, 'fake-cli.mjs');
   await fs.writeFile(fakeCli, '#!/usr/bin/env node\nprocess.stdout.write("wire-ok");\n', { mode: 0o700 });
 
+  // Operator-owned identity.json in the agent's state dir (HOME=tempDir below):
+  // the daemon must read it and send it as `identity` on agent_register, with
+  // unknown keys dropped client-side. The server normalizes the rest.
+  const stateDir = path.join(tempDir, '.agensis', 'workspace-wire', 'agent-wire');
+  await fs.mkdir(stateDir, { recursive: true });
+  await fs.writeFile(path.join(stateDir, 'identity.json'), JSON.stringify({
+    avatar: 'FX',
+    description: 'Wire contract test agent',
+    voice: { cartesia_voice_id: 'voice-wire-0001', speed: 1.1, emotion: 'calm' },
+    unknown_key: 'dropped',
+  }));
+
   const server = new WebSocket.Server({ host: '::1', port: 0 });
   await new Promise((resolve, reject) => {
     server.once('listening', resolve);
@@ -37,6 +49,11 @@ test('daemon honors the hub auth, register, job, delta, and result contract', { 
             assert.equal(frame.workspaceId, 'workspace-wire');
             assert.equal(frame.agentId, 'agent-wire');
             assert.equal(frame.metadata.runtime, 'agensis');
+            assert.deepEqual(frame.identity, {
+              avatar: 'FX',
+              description: 'Wire contract test agent',
+              voice: { cartesia_voice_id: 'voice-wire-0001', speed: 1.1, emotion: 'calm' },
+            });
             socket.send(JSON.stringify({
               type: 'agent_registered',
               connection: { name: 'wire-agent', host: 'test-host' },
@@ -127,6 +144,9 @@ test('daemon emits an agent_job_step frame per tool round trip', { timeout: 20_0
           const frame = JSON.parse(String(raw));
           frames.push(frame);
           if (frame.action === 'agent_register') {
+            // No identity.json on disk for this agent -> the frame must carry no
+            // identity key at all (not an empty object), same as before the feature.
+            assert.ok(!('identity' in frame));
             socket.send(JSON.stringify({ type: 'agent_registered', connection: { name: 'step-agent', host: 'test-host' } }));
             socket.send(JSON.stringify({
               type: 'agent_job',
