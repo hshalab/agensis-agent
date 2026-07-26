@@ -106,6 +106,7 @@ Usage:
   agensis connect --url <workspace-url> --token <token> --workspace <id> --agent <id> [options]
   agensis connect [--profile <name>]
   agensis setup [--url <agensis-url>] [--profile <name>] [--handle <name>]
+  agensis supervise [--profile <name>]
   agensis buddy connect --key <cbk_...> [--url <agensis-url>] [options]
 
 Required:
@@ -145,6 +146,15 @@ Options:
   --profile <name>        Save/reuse a local daemon profile, default: default
   --version               Print the CLI version
   --help                  Show this help
+
+agensis supervise [--profile <name>] [--poll-ms <ms>]
+  Runs the daemon as a supervised child instead of in this process, so an agent
+  can request a self-update (writing update-request.json into its own state
+  dir) with automatic install + health-check + rollback to the last-known-good
+  version on failure. Requires a saved profile (run "agensis setup" or
+  "agensis connect" once first). Recommended under a process manager with its
+  own restart policy (systemd Restart=always, launchd KeepAlive, pm2) so the
+  supervisor itself is recovered if it's ever killed.
 `;
 }
 
@@ -195,6 +205,15 @@ async function main() {
     if (daemonArgs.once) process.exit(0);
     return;
   }
+  if (args.command === "supervise") {
+    const profile = daemonProfileName(args.profile || "default");
+    const cached = await readDaemonProfile(profile);
+    if (!cached) throw new Error(daemonProfileSetupMessage(profile));
+    const { runSupervisor } = await import("../src/supervise.mjs");
+    const pollIntervalMs = args.pollMs ? Number(args.pollMs) : undefined;
+    await runSupervisor({ config: cached, runningVersion: AGENSIS_CLI_VERSION, profileName: profile, pollIntervalMs });
+    return;
+  }
   if (args.command === "setup") {
     const daemonArgs = await runSetupFlow(args);
     daemonArgs.exitOnOnce = true;
@@ -203,7 +222,7 @@ async function main() {
     return;
   }
   if (args.command !== "connect") {
-    throw new Error(`Unknown command "${args.command}". Use "agensis setup", "agensis connect --url ...", or "agensis buddy connect --key ...".`);
+    throw new Error(`Unknown command "${args.command}". Use "agensis setup", "agensis connect --url ...", "agensis supervise", or "agensis buddy connect --key ...".`);
   }
   const daemonArgs = await daemonArgsForConnect(args);
   daemonArgs.exitOnOnce = true;
