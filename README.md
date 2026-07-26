@@ -34,6 +34,16 @@ contents, sizes, and the absolute memory-root path, to the connected Agensis
 workspace. Each file is read-only, restricted to the derived or configured
 memory root, and capped at 256 KiB.
 
+Skill content synchronization is on by default. The daemon already advertises
+the NAMES of the skills it finds under `~/.claude/skills`, `~/.codex/skills` and
+`<project>/.claude/skills`; it also uploads each one's `SKILL.md` so agents
+elsewhere in the workspace can read a skill while this machine is offline. Reads
+are confined to those three roots, capped at 64 KiB per skill with any
+truncation marked in the text, and a file that cannot be read is simply reported
+as having no body. `--no-sync-skills` (or `AGENSIS_SYNC_SKILLS=0`) keeps the
+bodies local; only the names are then advertised. Opting out stops further
+uploads — it does not delete text already mirrored into the workspace.
+
 ## Repository layout
 
 - `packages/agensis-cli` — readable daemon source

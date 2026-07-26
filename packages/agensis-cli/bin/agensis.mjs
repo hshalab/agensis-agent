@@ -65,6 +65,10 @@ function parseArgs(argv) {
       args.syncMemory = true;
       continue;
     }
+    if (key === "noSyncSkills") {
+      args.syncSkills = false;
+      continue;
+    }
     if (key === "cursorbuddyBridge") {
       args.cursorBuddyBridge = true;
       continue;
@@ -127,6 +131,8 @@ Options:
                           (default isolates Claude/Codex to project + Agensis context)
   --sync-memory           Opt in to mirroring this project's Claude memory files
                           to the connected Agensis workspace (default: off)
+  --no-sync-skills        Stop mirroring the text of this machine's skills to the
+                          workspace; only their names are advertised (default: on)
   --model <id>            Default model to pass to supported coding CLIs
   --permission-mode <m>   default, accept_edits, or yolo
   --yolo                  Alias for --permission-mode yolo

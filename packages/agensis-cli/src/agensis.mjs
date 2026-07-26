@@ -10,6 +10,7 @@ import { createQueue } from "./queue.mjs";
 import { startCursorBuddyLocalBridge } from "./cursorbuddyLocalBridge.mjs";
 import { deriveMemoryRoot, snapshotMemory, memoryFingerprint } from "./memory.mjs";
 import { detectCommandEntries, detectSkillNames } from "./slashEnum.mjs";
+import { skillsFingerprint, snapshotSkills } from "./skills.mjs";
 import { loadSharedModelConfig, runSharedInference, sharedModelAdvertisements } from "./sharedInference.mjs";
 import {
   writeAgentMirror,
@@ -33,7 +34,7 @@ const DEFAULT_HEARTBEAT_MS = 15 * 1000;
 const DEFAULT_MAX_CONCURRENCY = 2;
 const LEAN_PROMPT_MAX_BYTES = 10 * 1024;
 const DEFAULT_MODEL = "claude-opus-4-8";
-export const AGENSIS_CLI_VERSION = "0.1.31";
+export const AGENSIS_CLI_VERSION = "0.1.32";
 
 export async function runAgensisDaemon(rawConfig = {}) {
   const config = normalizeConfig(rawConfig);
@@ -311,7 +312,11 @@ export async function runAgensisDaemon(rawConfig = {}) {
         ]).then(([caps, agentStatus]) => {
           send(ws, {
             action: "agent_heartbeat",
+            // skillsHash is omitted entirely when body sync is off — the server only
+            // nudges on a hash it was actually sent, so an opted-out daemon is never
+            // asked for bodies and never blocked for not having them.
             ...(caps ? { capabilitiesHash: caps.capabilitiesHash, memoryHash: caps.memoryHash } : {}),
+            ...(caps?.skillsHash ? { skillsHash: caps.skillsHash } : {}),
             metadata: heartbeatMetadata(
               config,
               queue,
@@ -343,6 +348,7 @@ export async function runAgensisDaemon(rawConfig = {}) {
         // clobbers an existing file, so human/agent edits persist across restarts.
         void ensureHeartbeatMd(config).catch(() => { });
         void pushMemorySnapshot(ws, config);
+        void pushSkillSnapshot(ws, config);
         // The listener persists across reconnects (only the ws reconnects), so this is
         // idempotent — a no-op once it's already running.
         startLanListener();
@@ -365,6 +371,13 @@ export async function runAgensisDaemon(rawConfig = {}) {
       }
       if (message.type === "agent_capabilities_refresh") {
         void pushCapabilitiesSnapshot(ws, config, currentReach());
+        return;
+      }
+      if (message.type === "agent_skills_refresh") {
+        // No capabilities re-push needed here (unlike the memory case above):
+        // handleAgentSkillSync advances the stored skillsHash itself, so the drift
+        // resolves on this one frame instead of looping on every beat.
+        void pushSkillSnapshot(ws, config);
         return;
       }
       if (message.type === "agent_inference_cancel") {
@@ -586,6 +599,12 @@ function normalizeConfig(raw) {
     // Local Claude memory can contain private project notes. Never upload it
     // unless the host operator opted in at daemon launch time.
     syncMemory: booleanOption(raw.syncMemory, process.env.AGENSIS_SYNC_MEMORY === "1"),
+    // Skill BODIES, unlike memory, are on by default: a skill is instructions for
+    // doing a job, its NAME already rides the capability push, and a workspace that
+    // can see the name but never the text is the bug this feature exists to fix.
+    // `--no-sync-skills` / AGENSIS_SYNC_SKILLS=0 is the opt-out for a host that would
+    // rather keep its SKILL.md files local.
+    syncSkills: booleanOption(raw.syncSkills, booleanOption(process.env.AGENSIS_SYNC_SKILLS, true)),
     hostFolders: normalizeHostFolders(raw.hostFolders ?? raw.host_folders ?? process.env.AGENSIS_HOST_FOLDERS),
   };
   if (config.sharedModelsFile && !path.isAbsolute(config.sharedModelsFile)) {
@@ -1558,7 +1577,11 @@ function sha1Short(str) {
 // both the full snapshot (agent_capabilities_sync) and every heartbeat, so the server
 // never has to recompute a canonical form — it just compares the heartbeat hash against
 // the last value it stored on a snapshot. `capabilitiesHash` covers skills/CLIs/MCP;
-// `memoryHash` covers the palace file list (stat-only, no content reads).
+// `memoryHash` covers the palace file list (stat-only, no content reads); `skillsHash`
+// covers the BODIES behind the advertised skill names (also stat-only) — a SKILL.md can
+// be edited without the name list changing, so it needs its own hash or the edit would
+// never reach the workspace. Null when body sync is off, which the server reads as
+// "this daemon does not do skill bodies": never nudged, never blocked.
 // Reach is passed in (not detected here) since it reflects live LAN-listener state
 // owned by runAgensisDaemon's closure, not something derivable from disk/cwd.
 async function computeCapabilities(config, reach = null) {
@@ -1577,7 +1600,10 @@ async function computeCapabilities(config, reach = null) {
   const sharedModels = sharedModelAdvertisements(config.sharedModels);
   const capabilitiesHash = sha1Short(JSON.stringify({ skills, commands, clis, mcpServers, memoryRoot, sharedModels, codingRoute: Boolean(config.codingCmd), shared: config.share, reach: reach || null }));
   const memoryHash = sha1Short(await memoryFingerprint(memoryRoot));
-  return { skills, commands, clis, mcpServers, memoryRoot, sharedModels, codingRoute: Boolean(config.codingCmd), shared: config.share, reach: reach || null, capabilitiesHash, memoryHash };
+  // Deliberately NOT folded into capabilitiesHash: a skill body edit should re-push
+  // bodies, not the whole capability snapshot, and the two travel on different frames.
+  const skillsHash = config.syncSkills ? sha1Short(await skillsFingerprint({ cwd: config.cwd })) : null;
+  return { skills, commands, clis, mcpServers, memoryRoot, sharedModels, codingRoute: Boolean(config.codingCmd), shared: config.share, reach: reach || null, capabilitiesHash, memoryHash, skillsHash };
 }
 
 // Push a snapshot of this agent's runtime capabilities (skills, CLIs, MCP servers,
@@ -1602,6 +1628,7 @@ async function pushCapabilitiesSnapshot(ws, config, reach = null) {
       reach: caps.reach || undefined,
       hash: caps.capabilitiesHash,
       memoryHash: caps.memoryHash,
+      skillsHash: caps.skillsHash,
     });
     log(`Capabilities synced — skills:${caps.skills.length} commands:${caps.commands.length} clis:${caps.clis.length} mcp:${caps.mcpServers.length}`);
   } catch (error) {
@@ -1644,6 +1671,43 @@ async function pushMemorySnapshot(ws, config) {
     log(`Synced ${files.length} memory file${files.length === 1 ? "" : "s"} from ${root}`);
   } catch (error) {
     log(`Memory sync skipped: ${error?.message || error}`);
+  }
+}
+
+// Push the BODIES behind the skill names this daemon advertises, so an agent elsewhere
+// in the workspace can read one of this machine's skills even while this machine is
+// offline. Sent on connect and whenever the server nudges `agent_skills_refresh` after
+// spotting the heartbeat's skillsHash drift — never on a heartbeat itself, which
+// carries the hash only.
+//
+// The fingerprint is taken BEFORE the bodies are read, on purpose. If a SKILL.md
+// changes mid-snapshot the server ends up storing the older hash against newer content,
+// so the next heartbeat sees drift and re-pushes. Hashing afterwards would store the
+// NEW hash against content read before the edit, and the stale copy would sit there
+// forever with nothing to knock it loose.
+//
+// Fire-and-forget: no skills directory, an unreadable file, a permission error — all
+// logged and dropped. Skill sync must never take the connection down with it.
+async function pushSkillSnapshot(ws, config) {
+  try {
+    // Opted out: send nothing and, like pushMemorySnapshot, leave whatever the
+    // workspace already stored alone. Turning the flag off stops new text going up;
+    // it is not a delete, and inventing one here would let a mistyped flag silently
+    // strip every other agent's access to this machine's skills.
+    if (!config.syncSkills) return;
+    const hash = sha1Short(await skillsFingerprint({ cwd: config.cwd }));
+    const skills = await snapshotSkills({ cwd: config.cwd });
+    send(ws, {
+      action: "agent_skill_sync",
+      workspaceId: config.workspace,
+      agentId: config.agent,
+      hash,
+      skills,
+    });
+    const truncated = skills.filter((skill) => skill.truncated).length;
+    log(`Synced ${skills.length} skill document${skills.length === 1 ? "" : "s"}${truncated ? ` (${truncated} truncated)` : ""}`);
+  } catch (error) {
+    log(`Skill sync skipped: ${error?.message || error}`);
   }
 }
 
