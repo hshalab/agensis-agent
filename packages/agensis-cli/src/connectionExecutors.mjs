@@ -92,6 +92,18 @@ function createKeyedMutex() {
 // and nothing else.
 const AGENSIS_MCP_ALLOWED_TOOLS = ["mcp__agensis"];
 
+// The SDK runs a NATIVE claude binary, and native builds ship WITHOUT the
+// dedicated Grep/Glob tools unless they are named here — sdk.d.ts says so on the
+// `tools` option ("native builds may provide search via Bash find/grep instead
+// of the dedicated Grep/Glob tools. List Grep/Glob here or in `allowedTools` to
+// get them"), and the installed 0.3.218 binary confirms it: the session's tool
+// list is 29 entries without these two and 31 with them. Absent, every search
+// the agent runs is a Bash `grep`/`find` whose entire stdout lands in context
+// unbounded, so one question becomes dozens of shell round trips. Both tools are
+// read-only and strictly weaker than the Bash the agent already has, so naming
+// them costs nothing and is not a permission widening in practice.
+const SEARCH_ALLOWED_TOOLS = ["Grep", "Glob"];
+
 function mapClaudePermission(permissionMode) {
   if (permissionMode === "yolo") return { permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true };
   if (permissionMode === "accept_edits") return { permissionMode: "acceptEdits" };
@@ -214,8 +226,9 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
         cwd: opts.cwd,
         model: opts.model,
         ...permission,
-        // Always allowed, in every permission mode — see AGENSIS_MCP_ALLOWED_TOOLS.
-        allowedTools: AGENSIS_MCP_ALLOWED_TOOLS,
+        // Always allowed, in every permission mode — see AGENSIS_MCP_ALLOWED_TOOLS
+        // and SEARCH_ALLOWED_TOOLS.
+        allowedTools: [...AGENSIS_MCP_ALLOWED_TOOLS, ...SEARCH_ALLOWED_TOOLS],
         additionalDirectories: opts.hostFolders && opts.hostFolders.length ? opts.hostFolders : undefined,
         mcpServers,
         strictMcpConfig: opts.leanCli ? true : undefined,
