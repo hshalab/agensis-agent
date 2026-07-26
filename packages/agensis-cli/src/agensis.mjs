@@ -20,6 +20,7 @@ import {
   ensureHeartbeatMd,
   heartbeatMdPath,
   readHeartbeatMd,
+  resolveStateDir,
 } from "./state.mjs";
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
@@ -904,7 +905,7 @@ async function runAgentJob(config, job, { signal }) {
     prompt,
     model: command.model,
     permissionMode: command.permissionMode,
-    hostFolders: resolveHostFolders(config, job),
+    hostFolders: resolveAdditionalDirectories(config, job),
     leanCli: config.leanCli,
     mcp: config.leanCli ? leanMcpRuntime(config) : null,
     sessionKey: `${job.workspaceId || config.workspace || ""}:${config.agent || config.handle || ""}`,
@@ -1033,7 +1034,7 @@ function buildAgentCommand(config, job) {
   const permissionMode = resolveJobPermissionMode(config, job);
   const cleanArgs = stripManagedFlags(args);
   let permissionFlags = permissionFlagsForMode(permissionMode);
-  const hostFolders = resolveHostFolders(config, job);
+  const additionalDirs = resolveAdditionalDirectories(config, job);
 
   if (isClaudeCommand(cmd)) {
     const nextArgs = [...cleanArgs];
@@ -1111,8 +1112,9 @@ function buildAgentCommand(config, job) {
       streamJson = cleanArgs.some((a) => /stream-json/.test(String(a)));
     }
     // Grant the coding CLI read/write access to the silo's configured host
-    // folders beyond its cwd. Claude Code accepts repeated --add-dir <path>.
-    for (const folder of hostFolders) nextArgs.push("--add-dir", folder);
+    // folders, plus this agent's own state dir (see resolveAdditionalDirectories),
+    // beyond its cwd. Claude Code accepts repeated --add-dir <path>.
+    for (const dir of additionalDirs) nextArgs.push("--add-dir", dir);
     return { cmd, args: nextArgs, model, permissionMode, permissionFlags, streamJson, env };
   }
 
@@ -1357,6 +1359,31 @@ function resolveHostFolders(config, job) {
     ?? job?.host_folders;
   const resolved = normalizeHostFolders(fromJob);
   return resolved.length > 0 ? resolved : (config.hostFolders || []);
+}
+
+// The coding CLI subprocess needs write access to this agent's own state dir
+// (~/.agensis/<workspace>/<agent>/ — see state.mjs) because the daemon asks
+// every job to overwrite status.json there and read heartbeat.md back. Absent
+// this, Claude Code's working-dir allowlist refuses the write outright ("may
+// only list files in the allowed working directories"), even under
+// --dangerously-skip-permissions — permissions.allow Write(...) does NOT
+// override this gate, only --add-dir (subprocess CLI) / additionalDirectories
+// (SDK, see connectionExecutors.mjs) do.
+//
+// Deliberately NOT folded into resolveHostFolders: that list is server-gated,
+// operator-configured, per-job metadata (workspace_agents.metadata.host_folders
+// is MANAGE_ONLY on the server specifically so a member with only 'write' can't
+// widen an agent's filesystem access — see backend-core.cjs). The state dir
+// here is derived ONLY from this daemon's own connection identity
+// (config.workspace/config.agent), never from job- or server-supplied
+// metadata, so it can't be widened by a misconfigured or malicious
+// host_folders value, and a bug in this function can't grant access beyond
+// this one agent's own directory (safeSegment in state.mjs sanitizes both
+// path segments against traversal).
+function resolveAdditionalDirectories(config, job) {
+  const dirs = resolveHostFolders(config, job);
+  const stateDir = resolveStateDir({ workspace: config.workspace, agent: config.agent });
+  return stateDir && !dirs.includes(stateDir) ? [...dirs, stateDir] : dirs;
 }
 
 // True when the daemon is running inside a container/sandbox where letting the
