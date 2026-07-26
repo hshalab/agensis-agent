@@ -55,6 +55,21 @@ test('Claude jobs exclude user customizations and load only the Agensis MCP', ()
   assert.doesNotMatch(command.args.join(' '), /aga_secret_token/);
 });
 
+test('Claude jobs always get --add-dir for their own state dir, alongside configured host folders', () => {
+  const command = agentTest.buildAgentCommand(
+    config({ codingCmd: 'claude -p', hostFolders: ['/srv/project'] }),
+    job(),
+  );
+  const addDirs = command.args
+    .map((arg, index) => (arg === '--add-dir' ? command.args[index + 1] : null))
+    .filter(Boolean);
+  assert.ok(addDirs.includes('/srv/project'), 'configured host folder missing');
+  const ownStateDir = path.join(os.homedir(), '.agensis', 'workspace-1', 'agent-1');
+  assert.ok(addDirs.includes(ownStateDir), 'own state dir missing from --add-dir list');
+  const siblingStateDir = path.join(os.homedir(), '.agensis', 'workspace-1', 'agent-2');
+  assert.ok(!addDirs.includes(siblingStateDir), 'sibling agent state dir must never be granted');
+});
+
 test('Codex jobs ignore user config, memory, plugins, hooks, and skills', () => {
   const command = agentTest.buildAgentCommand(
     config({ codingCmd: 'codex exec', model: 'gpt-5.6-sol' }),
