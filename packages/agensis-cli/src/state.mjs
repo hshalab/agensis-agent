@@ -13,6 +13,14 @@
 //                     report its own status; the daemon reads it each beat and folds it
 //                     into the heartbeat it sends up. The daemon NEVER writes this file,
 //                     so there is no self-write feedback loop.
+//   update-request.json — AGENT-OWNED trigger. The coding subprocess writes this to ask
+//                     the supervisor (see selfUpdate.mjs) to update+reload the daemon's
+//                     own connection. The supervisor clears it once picked up, so it is
+//                     never re-run on a stale request.
+//   update.json     — SUPERVISOR-OWNED version/rollback record: current + previous
+//                     version, and the result of the last attempt (including an
+//                     automatic rollback). Read-only from the agent/daemon side; only
+//                     selfUpdate.mjs's performSelfUpdate() writes it.
 //
 // Everything here is best-effort: a failure to create the dir or write a file is logged
 // by the caller and never fatal to the agent.
@@ -27,6 +35,15 @@ const HEARTBEAT_FILE = "heartbeat.json";
 const HEARTBEAT_MD_FILE = "heartbeat.md";
 const AGENT_FILE = "agent.json";
 const SOUL_FILE = "soul.md";
+const UPDATE_REQUEST_FILE = "update-request.json";
+const UPDATE_STATE_FILE = "update.json";
+
+// Caps so a runaway agent can't write a giant update request/state blob.
+const MAX_UPDATE_REQUEST_BYTES = 4 * 1024;
+const MAX_UPDATE_STATE_BYTES = 16 * 1024;
+// Versions are npm semver-ish strings; keep the accepted charset narrow since
+// this value is later interpolated into an `npm install pkg@<version>` argv.
+const VERSION_RE = /^[a-zA-Z0-9._+-]{1,64}$/;
 
 // Cap on how much heartbeat.md we read back into the prompt — it's human/agent-editable,
 // so a runaway edit shouldn't be able to balloon every job's prompt.
@@ -222,6 +239,100 @@ function clampField(value) {
   if (value == null) return "";
   const text = String(value).trim().replace(/\s+/g, " ");
   return text.slice(0, MAX_STATUS_FIELD);
+}
+
+export function updateRequestFilePath(config) {
+  return path.join(resolveStateDir(config), UPDATE_REQUEST_FILE);
+}
+
+export function updateStateFilePath(config) {
+  return path.join(resolveStateDir(config), UPDATE_STATE_FILE);
+}
+
+// Write the AGENT-OWNED update request: the coding subprocess (or any tool acting on
+// its behalf) asks the supervisor to update+reload to `targetVersion`. Requires Change
+// 1's --add-dir grant for this agent's own state dir to actually land on disk.
+export async function writeUpdateRequest(config, { targetVersion, note } = {}) {
+  const version = String(targetVersion || "").trim();
+  if (!VERSION_RE.test(version)) return false;
+  const dir = await ensureStateDir(config);
+  if (!dir) return false;
+  const payload = {
+    targetVersion: version,
+    note: clampField(note),
+    requestedAt: new Date().toISOString(),
+  };
+  return writeFileAtomic(path.join(dir, UPDATE_REQUEST_FILE), `${JSON.stringify(payload, null, 2)}\n`);
+}
+
+// Read the AGENT-OWNED update request. Returns { targetVersion, note?, requestedAt? } or
+// null when absent, unreadable, too big, malformed, or the version fails validation.
+// Never throws.
+export async function readUpdateRequest(config) {
+  const file = updateRequestFilePath(config);
+  let raw;
+  try {
+    const stat = await fsp.stat(file);
+    if (!stat.isFile() || stat.size > MAX_UPDATE_REQUEST_BYTES) return null;
+    raw = await fsp.readFile(file, "utf8");
+  } catch {
+    return null;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const targetVersion = String(parsed.targetVersion || "").trim();
+  if (!VERSION_RE.test(targetVersion)) return null;
+  const out = { targetVersion };
+  const note = clampField(parsed.note);
+  if (note) out.note = note;
+  if (typeof parsed.requestedAt === "string") out.requestedAt = parsed.requestedAt;
+  return out;
+}
+
+// Clear a picked-up (or invalid) update request so it is never re-run on a stale file.
+// Best-effort — a missing file is not an error.
+export async function clearUpdateRequest(config) {
+  try {
+    await fsp.rm(updateRequestFilePath(config), { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Read the SUPERVISOR-OWNED version/rollback record. Returns the parsed object, or null
+// when absent, unreadable, too big, or malformed. Never throws.
+export async function readUpdateState(config) {
+  const file = updateStateFilePath(config);
+  let raw;
+  try {
+    const stat = await fsp.stat(file);
+    if (!stat.isFile() || stat.size > MAX_UPDATE_STATE_BYTES) return null;
+    raw = await fsp.readFile(file, "utf8");
+  } catch {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+// Write the SUPERVISOR-OWNED version/rollback record. Only performSelfUpdate()
+// (selfUpdate.mjs) should call this — it is the single source of truth for what
+// version is current, what the fallback is, and how the last attempt went.
+export async function writeUpdateState(config, state = {}) {
+  const dir = await ensureStateDir(config);
+  if (!dir) return false;
+  const payload = { ...state, updatedAt: new Date().toISOString() };
+  return writeFileAtomic(path.join(dir, UPDATE_STATE_FILE), `${JSON.stringify(payload, null, 2)}\n`);
 }
 
 // Seed heartbeat.md with the default text ONLY if it doesn't already exist. This file is

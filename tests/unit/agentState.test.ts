@@ -12,6 +12,13 @@ import {
   ensureHeartbeatMd,
   heartbeatMdPath,
   readHeartbeatMd,
+  writeUpdateRequest,
+  readUpdateRequest,
+  clearUpdateRequest,
+  updateRequestFilePath,
+  readUpdateState,
+  writeUpdateState,
+  updateStateFilePath,
 } from '../../packages/agensis-cli/src/state.mjs';
 
 let home: string;
@@ -198,5 +205,59 @@ describe('readAgentStatus', () => {
   it('ignores an oversized status file', async () => {
     await writeStatus(JSON.stringify({ status: 'ok', pad: 'y'.repeat(9000) }));
     expect(await readAgentStatus(config)).toBeNull();
+  });
+});
+
+describe('update-request.json (agent-owned self-update trigger)', () => {
+  it('returns null when no request has been written', async () => {
+    expect(await readUpdateRequest(config)).toBeNull();
+  });
+
+  it('writes and reads back a valid request', async () => {
+    const ok = await writeUpdateRequest(config, { targetVersion: '0.1.31', note: 'testing rollback' });
+    expect(ok).toBe(true);
+    const request = await readUpdateRequest(config);
+    expect(request?.targetVersion).toBe('0.1.31');
+    expect(request?.note).toBe('testing rollback');
+    expect(typeof request?.requestedAt).toBe('string');
+  });
+
+  it('rejects a version with an unsafe charset (never reaches an npm install argv)', async () => {
+    expect(await writeUpdateRequest(config, { targetVersion: '0.1.31; rm -rf /' })).toBe(false);
+    expect(await readUpdateRequest(config)).toBeNull();
+  });
+
+  it('treats a hand-edited malformed version the same way on read', async () => {
+    await fs.mkdir(resolveStateDir(config), { recursive: true });
+    await fs.writeFile(updateRequestFilePath(config), JSON.stringify({ targetVersion: '../../etc' }));
+    expect(await readUpdateRequest(config)).toBeNull();
+  });
+
+  it('clearUpdateRequest removes the file and is a no-op when already absent', async () => {
+    await writeUpdateRequest(config, { targetVersion: '0.1.31' });
+    expect(await clearUpdateRequest(config)).toBe(true);
+    expect(await readUpdateRequest(config)).toBeNull();
+    expect(await clearUpdateRequest(config)).toBe(true);
+  });
+});
+
+describe('update.json (supervisor-owned version/rollback record)', () => {
+  it('returns null when absent', async () => {
+    expect(await readUpdateState(config)).toBeNull();
+  });
+
+  it('round-trips currentVersion/previousVersion/lastAttempt', async () => {
+    const ok = await writeUpdateState(config, {
+      currentVersion: '0.1.31',
+      previousVersion: '0.1.30',
+      lastAttempt: { version: '0.1.31', result: 'ok' },
+    });
+    expect(ok).toBe(true);
+    const state = await readUpdateState(config);
+    expect(state?.currentVersion).toBe('0.1.31');
+    expect(state?.previousVersion).toBe('0.1.30');
+    expect(state?.lastAttempt).toEqual({ version: '0.1.31', result: 'ok' });
+    expect(typeof state?.updatedAt).toBe('string');
+    expect(updateStateFilePath(config)).toBe(path.join(resolveStateDir(config), 'update.json'));
   });
 });
