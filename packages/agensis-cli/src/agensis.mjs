@@ -24,6 +24,7 @@ import { deriveMemoryRoot, snapshotMemory, memoryFingerprint } from "./memory.mj
 import { detectCommandEntries, detectSkillNames } from "./slashEnum.mjs";
 import { skillsFingerprint, snapshotSkills } from "./skills.mjs";
 import { loadSharedModelConfig, runSharedInference, sharedModelAdvertisements } from "./sharedInference.mjs";
+import { handleBridgeFrame, stopAllBridges } from "./bridges.mjs";
 import {
   writeAgentMirror,
   writeHeartbeatFile,
@@ -483,6 +484,21 @@ export async function runAgensisDaemon(rawConfig = {}) {
           activeInference.delete(requestId);
           send(ws, { action: "agent_heartbeat", metadata: heartbeatMetadata(config, queue, null, null, activeInference) });
         });
+        return;
+      }
+      // Channel bridges whose transport cannot run on a server: WhatsApp and
+      // Signal link as companion DEVICES holding account keys, and an OpenClaw
+      // gateway listens on 127.0.0.1. All three run here; the hub only ever
+      // sends bridge_send and receives bridge_inbound / bridge_status.
+      //
+      // The emit closure reads the LIVE `ws` rather than capturing one, because
+      // a reconnect swaps the socket underneath a long-lived bridge — the same
+      // reason the permission broker takes a live sender.
+      if (message.type === "bridge_start" || message.type === "bridge_send" || message.type === "bridge_stop") {
+        void handleBridgeFrame(
+          { ...message, action: message.type },
+          (frame) => send(ws, frame),
+        );
         return;
       }
       // --- Agent-mesh (F5/F6/F7) wire, mirrored from the hub's peer_ticket_request /
