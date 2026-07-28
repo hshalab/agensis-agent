@@ -76,6 +76,31 @@ export async function runAgensisDaemon(rawConfig = {}) {
     log,
   });
 
+  // Results that had nowhere to go because the socket was gone when the turn
+  // finished. A dropped socket does NOT stop the work: the CLI subprocess runs to
+  // completion, and before this its answer went straight into send()'s
+  // `readyState !== OPEN` early return and was lost — the daemon logged "Finished
+  // job" while the human was told the agent stopped responding. Park the frame and
+  // re-send it once we are registered again; the hub matches results on
+  // (jobId, agentId, workspaceId), not on the connection they arrive over.
+  const parkedResults = [];
+  const parkResult = (frame) => {
+    // Bounded: a daemon that can never reconnect must not grow this forever.
+    if (parkedResults.length >= 32) parkedResults.shift();
+    parkedResults.push(frame);
+    log(`Socket was gone — parked the result for job ${frame.jobId} to re-send on reconnect`);
+  };
+  const flushParkedResults = () => {
+    if (parkedResults.length === 0) return;
+    for (const frame of parkedResults.splice(0, parkedResults.length)) {
+      if (send(ws, frame)) {
+        log(`Re-sent the result for job ${frame.jobId} after reconnecting`);
+      } else {
+        parkedResults.push(frame);
+      }
+    }
+  };
+
   // --- Agent-mesh (F1/F5/F6/F7): opt-in LAN listener + peer ticket/list plumbing for
   // direct daemon-to-daemon job handoff. Every human<->agent turn stays hub-relayed
   // (unchanged above); this is scoped to daemon-initiated agent-to-agent collaboration
@@ -359,6 +384,9 @@ export async function runAgensisDaemon(rawConfig = {}) {
         socketRegistered = true;
         registeredConnection = message.connection || message.agent || null;
         applyAgentConfig(config, message.agent);
+        // Before anything else on a reconnect: hand back any turn that finished
+        // while we had no socket, so the hub can settle it instead of reaping it.
+        flushParkedResults();
         log(`Registered as ${message.connection?.name || config.name} on ${message.connection?.host || os.hostname()}`);
         if (config.onRegistered) {
           void Promise.resolve(config.onRegistered(config, message)).catch((error) => {
@@ -498,7 +526,17 @@ export async function runAgensisDaemon(rawConfig = {}) {
         return;
       }
       if (message.type === "agent_job" && message.job?.id) {
-        const result = queue.enqueue({ ...message.job, key: message.job.id, lane: laneKeyForJob(message.job), ws });
+        const result = queue.enqueue({
+          ...message.job,
+          key: message.job.id,
+          lane: laneKeyForJob(message.job),
+          // LIVE socket, not the one captured at enqueue time. A reconnect swaps
+          // `ws` underneath a turn that is still executing, and the answer has to
+          // go to the socket that exists when the turn ENDS. Same reasoning as the
+          // permission broker's send closure above.
+          get ws() { return ws; },
+          parkResult,
+        });
         if (result.accepted) {
           acceptedJobCount += 1;
           log(`Queued job ${message.job.id} at position ${result.position}`);
@@ -872,7 +910,7 @@ async function runCursorBuddyControlJob(config, job, intent, started) {
     sendDelta(response);
   }
 
-  send(job.ws, {
+  sendResult(job, {
     action: "agent_job_result",
     jobId: job.id,
     response,
@@ -1020,7 +1058,7 @@ async function runAgentJob(config, job, { signal, requestPermission = null }) {
     ? parser.result || (error ? "" : stderr)
     : stdout || (error ? "" : stderr) || latest || "";
 
-  send(job.ws, {
+  sendResult(job, {
     action: "agent_job_result",
     jobId: job.id,
     response,
@@ -1066,7 +1104,7 @@ async function runAmpAgentJob(config, job, { signal, started = Date.now() } = {}
   });
   const finish = ({ response = "", error = "", errorCode = "", threadId = "" } = {}) => {
     const ampThreadId = validAmpThreadId(threadId);
-    send(job.ws, {
+    sendResult(job, {
       action: "agent_job_result",
       jobId: job.id,
       response,
@@ -1983,6 +2021,15 @@ function send(ws, message) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
   ws.send(JSON.stringify(message));
   return true;
+}
+
+// A job's FINAL frame, which — unlike a delta — cannot be allowed to evaporate.
+// Deltas are cosmetic and the next one supersedes them; the result IS the turn.
+// If the socket is down, hand it to the connect scope to re-send on reconnect.
+function sendResult(job, frame) {
+  if (send(job.ws, frame)) return true;
+  job.parkResult?.(frame);
+  return false;
 }
 
 function latestLine(text) {
