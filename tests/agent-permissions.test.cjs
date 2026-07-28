@@ -1,0 +1,364 @@
+'use strict';
+
+// permissions.mjs — interactive tool approvals, plus the two places
+// connectionExecutors.mjs consumes them (the Claude SDK's canUseTool callback
+// and Codex app-server's requestApproval JSON-RPC requests).
+//
+// The behaviour that matters here is not "does a prompt appear" but the
+// direction of every failure: an undeliverable request, an expired one, a
+// cancelled job and a dead socket must all DENY, because each of them means
+// nobody is going to answer. A bug that parks instead holds the turn open until
+// the job's own 30-minute timeout kills it.
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
+const { pathToFileURL } = require('node:url');
+const path = require('node:path');
+
+const loadPermissions = () =>
+  import(pathToFileURL(path.resolve(__dirname, '../packages/agensis-cli/src/permissions.mjs')).href);
+const loadExecutors = () =>
+  import(pathToFileURL(path.resolve(__dirname, '../packages/agensis-cli/src/connectionExecutors.mjs')).href);
+
+// The shape the Claude SDK hands canUseTool as `suggestions` — the rules it
+// would write if a human picked "always allow".
+const bashCloneSuggestions = [{
+  type: 'addRules',
+  behavior: 'allow',
+  destination: 'localSettings',
+  rules: [{ toolName: 'Bash', ruleContent: 'git clone:*' }],
+}];
+
+// --- rule identity ----------------------------------------------------------
+
+test('a rule key round-trips through the canonical string the server stores', async () => {
+  const { ruleKey, parseRuleKey } = await loadPermissions();
+  assert.equal(ruleKey({ toolName: 'Bash', ruleContent: 'git clone:*' }), 'Bash(git clone:*)');
+  assert.equal(ruleKey({ toolName: 'WebFetch' }), 'WebFetch');
+  assert.equal(ruleKey({ toolName: '' }), '');
+  assert.deepEqual(parseRuleKey('Bash(git clone:*)'), { toolName: 'Bash', ruleContent: 'git clone:*' });
+  assert.deepEqual(parseRuleKey('WebFetch'), { toolName: 'WebFetch' });
+});
+
+test('only allow-rules are harvested from suggestions — never a mode flip or a new directory', async () => {
+  const { suggestionRuleKeys } = await loadPermissions();
+  const keys = suggestionRuleKeys([
+    ...bashCloneSuggestions,
+    { type: 'setMode', mode: 'bypassPermissions', destination: 'session' },
+    { type: 'addDirectories', directories: ['/'], destination: 'session' },
+    { type: 'addRules', behavior: 'deny', destination: 'session', rules: [{ toolName: 'Bash', ruleContent: 'rm:*' }] },
+  ]);
+  // A setMode suggestion would turn "always allow this command" into full yolo,
+  // and addDirectories would widen the filesystem allowlist that host_folders
+  // deliberately gates behind the manage role.
+  assert.deepEqual(keys, ['Bash(git clone:*)']);
+});
+
+test('stored rules are read from either the canonical strings or raw rule objects', async () => {
+  const { normalizeStoredRules, jobPermissionRules } = await loadPermissions();
+  assert.deepEqual(normalizeStoredRules(['Bash(git clone:*)', 'Bash(git clone:*)']), ['Bash(git clone:*)']);
+  assert.deepEqual(normalizeStoredRules([{ toolName: 'Bash', ruleContent: 'git push:*' }]), ['Bash(git push:*)']);
+  assert.deepEqual(normalizeStoredRules(null), []);
+  assert.deepEqual(
+    jobPermissionRules({ agent: { metadata: { permission_rules: ['WebFetch'] } } }),
+    ['WebFetch'],
+  );
+});
+
+test('a stored rule matches the identical suggestion, a different one, or a whole tool', async () => {
+  const { isAllowedByStoredRules } = await loadPermissions();
+  const stored = ['Bash(git clone:*)', 'WebFetch'];
+
+  assert.equal(isAllowedByStoredRules(stored, { toolName: 'Bash', suggestions: bashCloneSuggestions }), true);
+  // A whole-tool rule carries no content, so it covers any call to that tool.
+  assert.equal(isAllowedByStoredRules(stored, { toolName: 'WebFetch', suggestions: [] }), true);
+  // Claude considers `git push` a different permission and suggests a different
+  // rule for it — so it must be asked, not silently swept in by the clone grant.
+  assert.equal(isAllowedByStoredRules(stored, {
+    toolName: 'Bash',
+    suggestions: [{ type: 'addRules', behavior: 'allow', destination: 'localSettings', rules: [{ toolName: 'Bash', ruleContent: 'git push:*' }] }],
+  }), false);
+  // Same tool, no matching suggestion: a bare tool name in the input must NOT
+  // satisfy a content-scoped stored rule.
+  assert.equal(isAllowedByStoredRules(['Bash(git clone:*)'], { toolName: 'Bash', suggestions: [] }), false);
+  assert.equal(isAllowedByStoredRules([], { toolName: 'Bash', suggestions: bashCloneSuggestions }), false);
+});
+
+// --- the broker -------------------------------------------------------------
+
+test('a request rides the socket and resolves with the decision that comes back', async () => {
+  const { createPermissionBroker } = await loadPermissions();
+  const sent = [];
+  const broker = createPermissionBroker({ send: (frame) => { sent.push(frame); return true; } });
+
+  const pending = broker.request({
+    jobId: 'job-1',
+    toolName: 'Bash',
+    detail: 'git clone https://github.com/x/y',
+    suggestions: bashCloneSuggestions,
+  });
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].action, 'agent_permission_request');
+  assert.equal(sent[0].jobId, 'job-1');
+  assert.equal(sent[0].toolName, 'Bash');
+  assert.deepEqual(sent[0].rules, ['Bash(git clone:*)']);
+  // "always" is only offered when there is a concrete rule to make permanent.
+  assert.deepEqual(sent[0].scopes, ['once', 'session', 'always']);
+
+  broker.decide({ requestId: sent[0].requestId, behavior: 'allow', scope: 'always', decidedBy: 'Jason' });
+  assert.deepEqual(await pending, { behavior: 'allow', scope: 'always', decidedBy: 'Jason' });
+  assert.equal(broker.pendingCount(), 0);
+});
+
+test('a request with no rule to store offers only once and session', async () => {
+  const { createPermissionBroker } = await loadPermissions();
+  const sent = [];
+  const broker = createPermissionBroker({ send: (frame) => { sent.push(frame); return true; } });
+  const pending = broker.request({ jobId: 'job-1', toolName: 'Codex command' });
+  assert.deepEqual(sent[0].scopes, ['once', 'session']);
+  broker.decide({ requestId: sent[0].requestId, behavior: 'deny' });
+  assert.equal((await pending).behavior, 'deny');
+});
+
+test('an undeliverable request denies immediately instead of parking on a dead socket', async () => {
+  const { createPermissionBroker } = await loadPermissions();
+  const broker = createPermissionBroker({ send: () => false });
+  const outcome = await broker.request({ jobId: 'job-1', toolName: 'Bash' });
+  assert.equal(outcome.behavior, 'deny');
+  assert.match(outcome.message, /unreachable/i);
+  assert.equal(broker.pendingCount(), 0);
+});
+
+test('an unanswered request expires as a denial the model can explain', async () => {
+  const { createPermissionBroker } = await loadPermissions();
+  const broker = createPermissionBroker({ send: () => true, timeoutMs: 5 });
+  const outcome = await broker.request({ jobId: 'job-1', toolName: 'Bash' });
+  assert.equal(outcome.behavior, 'deny');
+  assert.match(outcome.message, /Nobody approved this/);
+});
+
+test('cancelling a job denies every request parked for it and leaves other jobs alone', async () => {
+  const { createPermissionBroker } = await loadPermissions();
+  const broker = createPermissionBroker({ send: () => true });
+  const mine = broker.request({ jobId: 'job-1', toolName: 'Bash' });
+  const other = broker.request({ jobId: 'job-2', toolName: 'Bash' });
+
+  assert.equal(broker.cancelJob('job-1'), 1);
+  assert.equal((await mine).behavior, 'deny');
+  assert.equal(broker.pendingCount(), 1);
+
+  broker.shutdown();
+  assert.equal((await other).behavior, 'deny');
+});
+
+test('a decision for an unknown request id is ignored rather than crashing the socket handler', async () => {
+  const { createPermissionBroker } = await loadPermissions();
+  const broker = createPermissionBroker({ send: () => true });
+  assert.equal(broker.decide({ requestId: 'nope', behavior: 'allow' }), false);
+  assert.equal(broker.decide({}), false);
+});
+
+// --- Claude SDK lane --------------------------------------------------------
+
+/** A fake SDK query that calls canUseTool once, then answers with the verdict it got. */
+function permissionProbeQuery({ toolName = 'Bash', input = { command: 'git clone x' }, suggestions = bashCloneSuggestions } = {}) {
+  let seen = null;
+  let verdict = null;
+  const queryFn = ({ prompt, options }) => {
+    seen = options;
+    const gen = (async function* () {
+      for await (const _input of prompt) {
+        verdict = await options.canUseTool(toolName, input, { suggestions, signal: new AbortController().signal, toolUseID: 't1', requestId: 'r1' });
+        yield { type: 'result', subtype: 'success', result: 'done', session_id: 's1' };
+      }
+    })();
+    gen.interrupt = async () => {};
+    return gen;
+  };
+  return { queryFn, options: () => seen, verdict: () => verdict };
+}
+
+test('claude sdk executor: a tool needing approval asks the human and allows on yes', async () => {
+  const { createClaudeSdkExecutor } = await loadExecutors();
+  const probe = permissionProbeQuery();
+  const asked = [];
+  const ex = createClaudeSdkExecutor({
+    queryFn: probe.queryFn,
+    requestPermission: async (payload) => { asked.push(payload); return { behavior: 'allow', scope: 'once' }; },
+  });
+
+  const result = await ex.run({ cwd: '/tmp', prompt: 'clone it', sessionKey: 'silo-1', job: { id: 'job-9' }, onData: () => {} });
+
+  assert.equal(result.status, 0);
+  assert.equal(asked.length, 1);
+  assert.equal(asked[0].jobId, 'job-9');
+  assert.equal(asked[0].toolName, 'Bash');
+  assert.equal(asked[0].detail, 'git clone x');
+  // 'once' grants exactly this call: handing the SDK its suggestions back would
+  // silently upgrade it to "for the rest of the session".
+  assert.deepEqual(probe.verdict(), { behavior: 'allow' });
+});
+
+test('claude sdk executor: allowing for the session hands the SDK its own suggestions back', async () => {
+  const { createClaudeSdkExecutor } = await loadExecutors();
+  const probe = permissionProbeQuery();
+  const ex = createClaudeSdkExecutor({
+    queryFn: probe.queryFn,
+    requestPermission: async () => ({ behavior: 'allow', scope: 'session' }),
+  });
+
+  await ex.run({ cwd: '/tmp', prompt: 'clone it', sessionKey: 'silo-1', job: { id: 'job-9' }, onData: () => {} });
+  assert.deepEqual(probe.verdict(), { behavior: 'allow', updatedPermissions: bashCloneSuggestions });
+});
+
+test('claude sdk executor: a denial reaches the model as a message, not an opaque tool error', async () => {
+  const { createClaudeSdkExecutor } = await loadExecutors();
+  const probe = permissionProbeQuery();
+  const ex = createClaudeSdkExecutor({
+    queryFn: probe.queryFn,
+    requestPermission: async () => ({ behavior: 'deny', message: 'Jason denied this tool call.' }),
+  });
+
+  await ex.run({ cwd: '/tmp', prompt: 'clone it', sessionKey: 'silo-1', job: { id: 'job-9' }, onData: () => {} });
+  assert.deepEqual(probe.verdict(), { behavior: 'deny', message: 'Jason denied this tool call.' });
+});
+
+test('claude sdk executor: a rule the workspace already granted permanently is not re-asked', async () => {
+  const { createClaudeSdkExecutor } = await loadExecutors();
+  const probe = permissionProbeQuery();
+  let asked = 0;
+  const ex = createClaudeSdkExecutor({
+    queryFn: probe.queryFn,
+    requestPermission: async () => { asked += 1; return { behavior: 'deny' }; },
+  });
+
+  await ex.run({
+    cwd: '/tmp',
+    prompt: 'clone it',
+    sessionKey: 'silo-1',
+    job: { id: 'job-9', agent: { metadata: { permission_rules: ['Bash(git clone:*)'] } } },
+    onData: () => {},
+  });
+
+  // Otherwise "always allow" would mean "ask me again on every new job".
+  assert.equal(asked, 0);
+  assert.deepEqual(probe.verdict(), { behavior: 'allow' });
+});
+
+test('claude sdk executor: with no broker at all, canUseTool is left unset as before', async () => {
+  const { createClaudeSdkExecutor } = await loadExecutors();
+  const probe = permissionProbeQuery();
+  const ex = createClaudeSdkExecutor({ queryFn: probe.queryFn });
+  // The fake would throw calling an undefined canUseTool; swallow that and
+  // assert on the option the SDK was handed instead.
+  await ex.run({ cwd: '/tmp', prompt: 'x', sessionKey: 'silo-1', job: { id: 'j' }, onData: () => {} }).catch(() => {});
+  assert.equal(probe.options().canUseTool, undefined);
+});
+
+// --- Codex lane -------------------------------------------------------------
+
+function fakeCodexChild() {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stdout.setEncoding = () => {};
+  child.stderr = new EventEmitter();
+  child.stderr.setEncoding = () => {};
+  const writes = [];
+  child.stdin = { write: (chunk) => writes.push(chunk) };
+  child.kill = () => child.emit('exit', 0, null);
+  child.writes = writes;
+  child.send = (obj) => child.stdout.emit('data', `${JSON.stringify(obj)}\n`);
+  return child;
+}
+
+/** Drives one command-approval request through a codex turn and reports the answer. */
+function codexApprovalServer(child, { availableDecisions } = {}) {
+  let approvalResponse = null;
+  const threadId = 'thread-1';
+  const turnId = 'turn-1';
+  const emitTurn = () => {
+    child.send({ method: 'item/completed', params: { threadId, turnId, item: { type: 'agentMessage', id: 'i1', text: 'ok' } } });
+    child.send({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'completed' } } });
+  };
+  const original = child.stdin.write;
+  child.stdin.write = (chunk) => {
+    original(chunk);
+    const { id, method } = JSON.parse(chunk);
+    if (id === 'approval-1' && !method) {
+      approvalResponse = JSON.parse(chunk);
+      queueMicrotask(emitTurn);
+      return;
+    }
+    if (method === 'initialize') queueMicrotask(() => child.send({ id, result: { codexHome: '/tmp' } }));
+    else if (method === 'thread/start') queueMicrotask(() => child.send({ id, result: { thread: { id: threadId } } }));
+    else if (method === 'turn/start') {
+      queueMicrotask(() => {
+        child.send({ id, result: { turn: { id: turnId, status: 'inProgress' } } });
+        child.send({ method: 'turn/started', params: { threadId, turn: { id: turnId } } });
+        child.send({
+          id: 'approval-1',
+          method: 'item/commandExecution/requestApproval',
+          params: { threadId, turnId, itemId: 'item-1', command: ['git', 'clone', 'https://x/y'], reason: 'network access', ...(availableDecisions ? { availableDecisions } : {}) },
+        });
+      });
+    }
+  };
+  return { approvalResponse: () => approvalResponse };
+}
+
+test('codex app-server executor: an approval request asks the human instead of auto-declining', async () => {
+  const { createCodexAppServerExecutor } = await loadExecutors();
+  const child = fakeCodexChild();
+  const server = codexApprovalServer(child);
+  const asked = [];
+  const ex = createCodexAppServerExecutor({
+    spawnFn: () => child,
+    requestPermission: async (payload) => { asked.push(payload); return { behavior: 'allow', scope: 'session' }; },
+  });
+
+  const result = await ex.run({ cwd: '/tmp', prompt: 'clone it', sessionKey: 'silo-1', job: { id: 'job-3' }, onData: () => {} });
+
+  assert.equal(result.status, 0);
+  assert.equal(asked.length, 1);
+  assert.equal(asked[0].jobId, 'job-3');
+  assert.equal(asked[0].toolName, 'Codex command');
+  assert.equal(asked[0].detail, 'git clone https://x/y');
+  assert.deepEqual(server.approvalResponse(), { id: 'approval-1', result: { decision: 'acceptForSession' } });
+});
+
+test('codex app-server executor: approving once picks the narrower decision when codex offers it', async () => {
+  const { createCodexAppServerExecutor } = await loadExecutors();
+  const child = fakeCodexChild();
+  const server = codexApprovalServer(child, { availableDecisions: ['accept', 'acceptForSession', 'decline'] });
+  const ex = createCodexAppServerExecutor({
+    spawnFn: () => child,
+    requestPermission: async () => ({ behavior: 'allow', scope: 'once' }),
+  });
+
+  await ex.run({ cwd: '/tmp', prompt: 'clone it', sessionKey: 'silo-1', job: { id: 'job-3' }, onData: () => {} });
+  assert.deepEqual(server.approvalResponse(), { id: 'approval-1', result: { decision: 'accept' } });
+});
+
+test('codex app-server executor: a denial declines, and so does a broker that throws', async () => {
+  const { createCodexAppServerExecutor } = await loadExecutors();
+
+  const denied = fakeCodexChild();
+  const deniedServer = codexApprovalServer(denied);
+  await createCodexAppServerExecutor({
+    spawnFn: () => denied,
+    requestPermission: async () => ({ behavior: 'deny', message: 'no' }),
+  }).run({ cwd: '/tmp', prompt: 'x', sessionKey: 'silo-a', job: { id: 'j' }, onData: () => {} });
+  assert.deepEqual(deniedServer.approvalResponse(), { id: 'approval-1', result: { decision: 'decline' } });
+
+  const broken = fakeCodexChild();
+  const brokenServer = codexApprovalServer(broken);
+  await createCodexAppServerExecutor({
+    spawnFn: () => broken,
+    requestPermission: async () => { throw new Error('broker exploded'); },
+  }).run({ cwd: '/tmp', prompt: 'x', sessionKey: 'silo-b', job: { id: 'j' }, onData: () => {} });
+  // A broker that throws must not leave the codex turn hung waiting on a
+  // response that will never be written.
+  assert.deepEqual(brokenServer.approvalResponse(), { id: 'approval-1', result: { decision: 'decline' } });
+});

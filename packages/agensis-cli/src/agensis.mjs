@@ -17,6 +17,7 @@ import {
   validAmpThreadId,
 } from "./ampRuntime.mjs";
 import { summarizeToolInput } from "./connectionExecutors.mjs";
+import { createPermissionBroker } from "./permissions.mjs";
 import { createQueue } from "./queue.mjs";
 import { startCursorBuddyLocalBridge } from "./cursorbuddyLocalBridge.mjs";
 import { deriveMemoryRoot, snapshotMemory, memoryFingerprint } from "./memory.mjs";
@@ -65,6 +66,15 @@ export async function runAgensisDaemon(rawConfig = {}) {
   let socketRegistered = false;
   let registeredConnection = null;
   const activeInference = new Map();
+
+  // Interactive tool approvals. The send closure reads the LIVE `ws` rather than
+  // capturing one, because a reconnect swaps the socket underneath every parked
+  // request; a request whose delivery fails is denied on the spot rather than
+  // parked against a socket nobody is listening on.
+  const permissions = createPermissionBroker({
+    send: (frame) => send(ws, frame),
+    log,
+  });
 
   // --- Agent-mesh (F1/F5/F6/F7): opt-in LAN listener + peer ticket/list plumbing for
   // direct daemon-to-daemon job handoff. Every human<->agent turn stays hub-relayed
@@ -208,6 +218,7 @@ export async function runAgensisDaemon(rawConfig = {}) {
   const stop = () => {
     stopped = true;
     abortInferenceRequests(activeInference);
+    permissions.shutdown("The agent daemon shut down before this was approved.");
     if (reconnectTimer) clearTimeout(reconnectTimer);
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (fileHeartbeatTimer) clearInterval(fileHeartbeatTimer);
@@ -233,7 +244,7 @@ export async function runAgensisDaemon(rawConfig = {}) {
     // then drain. Otherwise run conversations in parallel up to the cap.
     concurrency: config.once ? 1 : config.maxConcurrency,
     runJob: async (job, ctx) => {
-      await runAgentJob(config, job, ctx);
+      await runAgentJob(config, job, { ...ctx, requestPermission: permissions.request });
       if (config.once) stop();
     },
   });
@@ -397,9 +408,19 @@ export async function runAgensisDaemon(rawConfig = {}) {
       }
       if (message.type === "agent_job_cancel") {
         const jobId = String(message.jobId || "");
-        if (jobId && queue.cancel(jobId, message.reason || "Cancelled by Agensis")) {
-          log(`Cancelled job ${jobId}`);
+        if (jobId) {
+          // Deny first: a turn parked on an approval is not watching its abort
+          // signal, so cancelling the queue entry alone leaves it waiting on a
+          // question whose answer stopped mattering.
+          permissions.cancelJob(jobId, message.reason || "Cancelled by Agensis");
+          if (queue.cancel(jobId, message.reason || "Cancelled by Agensis")) {
+            log(`Cancelled job ${jobId}`);
+          }
         }
+        return;
+      }
+      if (message.type === "agent_permission_decision") {
+        permissions.decide(message);
         return;
       }
       if (message.type === "agent_inference_request" && message.requestId) {
@@ -490,6 +511,9 @@ export async function runAgensisDaemon(rawConfig = {}) {
 
     ws.on("close", (code, reason) => {
       abortInferenceRequests(activeInference);
+      // Whoever was going to answer these can no longer reach us, and the
+      // reconnect gets a fresh socket the server has no request ids for.
+      permissions.shutdown();
       socketRegistered = false;
       registeredConnection = null;
       const closeReason = String(reason || "");
@@ -861,7 +885,7 @@ async function runCursorBuddyControlJob(config, job, intent, started) {
   log(`Finished native CursorBuddy ${intent.action} job ${job.id} in ${Math.round((Date.now() - started) / 1000)}s`);
 }
 
-async function runAgentJob(config, job, { signal }) {
+async function runAgentJob(config, job, { signal, requestPermission = null }) {
   const started = Date.now();
   log(`Starting job ${job.id}`);
   if (isAmpJob(job)) {
@@ -959,6 +983,9 @@ async function runAgentJob(config, job, { signal }) {
     mcp: config.leanCli ? leanMcpRuntime(config) : null,
     sessionKey: `${job.workspaceId || config.workspace || ""}:${config.agent || config.handle || ""}`,
     clientVersion: AGENSIS_CLI_VERSION,
+    // Interactive approvals. Absent (peer-relayed jobs, tests) the pooled
+    // executors keep their pre-broker behaviour: deny rather than self-approve.
+    requestPermission,
     onData: (chunk) => {
       if (parser) {
         parser.feed(chunk);

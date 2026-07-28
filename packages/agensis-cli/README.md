@@ -164,6 +164,37 @@ Each model appears in the Agensis chat selector as a workspace-scoped route.
 Inference requests relay over the existing authenticated daemon connection;
 the model server does not need a public listener.
 
+## Tool approvals
+
+In the default permission mode the daemon asks a human before running a tool the
+agent isn't already cleared for. The request goes to agensis as an
+`agent_permission_request` frame, appears as a card in the conversation the job
+is running in, and the answer comes back as `agent_permission_decision`. The
+turn parks until someone answers; after `AGENSIS_PERMISSION_TIMEOUT_MS` (default
+10 minutes) it is refused, so the model reports "nobody approved this" rather
+than the whole job dying on its own timeout.
+
+Answers come in three widths: **once** (this call), **this session** (handed to
+the coding CLI as a session rule, gone when the connection closes), and
+**always** — stored on the agent in agensis and replayed into every later job,
+so it survives a daemon restart.
+
+Two things worth knowing:
+
+- **A settings file on this host is not the grant store.** Lean mode (the
+  default) runs Claude with `settingSources: []`, and the subprocess lane passes
+  `--safe-mode`, so `~/.claude/settings.local.json` is not read at all. Editing
+  it has no effect and produces no error. Grants live in agensis, on the agent.
+- **A grant cannot reach a folder.** Access outside the working directory is a
+  separate gate that no permission rule lifts — not even
+  `--dangerously-skip-permissions`. Use `--host-folder` (or the agent's Host
+  folders in agensis) for that.
+
+`--permission-mode yolo` skips asking entirely and hands the coding CLI
+unrestricted access to this machine; `accept_edits` auto-approves file edits
+only. Codex agents can be answered once/session but not always: the app-server
+has no per-rule grant to store.
+
 ## Security
 
 The daemon runs on your machine and executes the configured coding command in

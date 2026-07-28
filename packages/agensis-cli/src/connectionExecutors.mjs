@@ -24,6 +24,7 @@
 // lifetime; idle sessions self-close after idleCloseMs.
 
 import { spawn } from "node:child_process";
+import { isAllowedByStoredRules, jobPermissionRules } from "./permissions.mjs";
 
 const DEFAULT_IDLE_CLOSE_MS = 10 * 60 * 1000;
 
@@ -173,13 +174,73 @@ function connectionFingerprint(opts) {
     leanCli: !!opts.leanCli,
     mcpUrl: opts.mcp?.url || "",
     mcpToken: opts.mcp?.env?.AGENSIS_MCP_TOKEN || "",
+    // Whether the session was built with an approval callback at all — not the
+    // callback itself, which is stable for the process. `canUseTool` is fixed at
+    // session creation, so a session opened by a job that had no broker would be
+    // REUSED by one that does, and the SDK would throw "canUseTool callback is
+    // not provided." on the first tool needing approval. A changed answer here
+    // rebuilds the session instead.
+    canAsk: !!opts.requestPermission,
   });
 }
 
 /**
- * @param {{ queryFn?: Function, idleCloseMs?: number }} [opts]
+ * Ask a human, through Agensis, whether this tool call may run.
+ *
+ * Bound to the SESSION, but every answer it needs — which job to post into,
+ * which rules the workspace already granted — belongs to the TURN, because a
+ * pooled session outlives any single job. `session.activeTurn` is the turn the
+ * CLI is executing right now, so it is the correct source; a request arriving
+ * with no active turn cannot be routed to a conversation and is denied rather
+ * than parked forever.
+ *
+ * A stored rule short-circuits the round trip entirely: the human already
+ * answered this question permanently, and re-asking would make "always allow"
+ * mean "ask me every time a new job starts".
  */
-export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CLOSE_MS } = {}) {
+function makeCanUseTool(session, fallbackRequester) {
+  return async (toolName, input, context = {}) => {
+    const turn = session.activeTurn;
+    if (!turn) {
+      return { behavior: "deny", message: "This tool call arrived with no active job to ask about." };
+    }
+    // The turn's requester, not the session's: a pooled session is created once
+    // and then serves jobs for the rest of the process, so binding the daemon's
+    // socket-backed broker at creation time would pin whichever one happened to
+    // be live for the first job.
+    const requestPermission = turn.requestPermission || fallbackRequester;
+    if (!requestPermission) {
+      return { behavior: "deny", message: "This agent has no way to ask for approval right now." };
+    }
+    if (isAllowedByStoredRules(turn.permissionRules, { toolName, suggestions: context.suggestions })) {
+      return { behavior: "allow" };
+    }
+    const decision = await requestPermission({
+      jobId: turn.jobId,
+      toolName,
+      title: context.title,
+      description: context.description,
+      detail: summarizeToolInput(input),
+      input,
+      suggestions: context.suggestions,
+      signal: context.signal,
+    });
+    if (decision?.behavior !== "allow") {
+      return { behavior: "deny", message: decision?.message || "This tool call was not approved." };
+    }
+    // 'once' grants exactly this call. Both wider scopes hand the SDK its own
+    // suggestions back, which is what stops it re-prompting for the rest of the
+    // session; 'always' is additionally persisted server-side onto the agent, so
+    // it survives into jobs this session will never see.
+    const updatedPermissions = decision.scope === "once" ? undefined : context.suggestions;
+    return updatedPermissions?.length ? { behavior: "allow", updatedPermissions } : { behavior: "allow" };
+  };
+}
+
+/**
+ * @param {{ queryFn?: Function, idleCloseMs?: number, requestPermission?: Function }} [opts]
+ */
+export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CLOSE_MS, requestPermission } = {}) {
   const sessions = new Map(); // sessionKey -> one long-lived SDK query + input queue
   const withLock = createKeyedMutex();
 
@@ -207,16 +268,29 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
   };
 
   const ensureSession = async (sessionKey, opts) => {
-    let session = sessions.get(sessionKey);
+    const existing = sessions.get(sessionKey);
     const fingerprint = connectionFingerprint(opts);
-    if (session && session.fingerprint === fingerprint && !session.closed) return session;
-    if (session) closeSession(sessionKey, session);
+    if (existing && existing.fingerprint === fingerprint && !existing.closed) return existing;
+    if (existing) closeSession(sessionKey, existing);
     if (!queryFn) {
       const mod = await import("@anthropic-ai/claude-agent-sdk");
       queryFn = mod.query;
     }
     const queue = new PushQueue();
     const permission = mapClaudePermission(opts.permissionMode);
+    // Allocated BEFORE the query so canUseTool can close over the same object the
+    // run loop later writes `activeTurn` onto. Rebuilding the object afterwards
+    // would hand the callback a stale copy whose activeTurn is forever null.
+    const session = {
+      query: null,
+      queue,
+      sessionId: "",
+      idleTimer: null,
+      activeTurn: null,
+      closed: false,
+      terminalError: null,
+      fingerprint,
+    };
     const mcpServers = opts.leanCli && opts.mcp
       ? { agensis: { type: "http", url: opts.mcp.url, headers: { Authorization: "Bearer ${AGENSIS_MCP_TOKEN}" } } }
       : undefined;
@@ -229,6 +303,12 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
         // Always allowed, in every permission mode — see AGENSIS_MCP_ALLOWED_TOOLS
         // and SEARCH_ALLOWED_TOOLS.
         allowedTools: [...AGENSIS_MCP_ALLOWED_TOOLS, ...SEARCH_ALLOWED_TOOLS],
+        // Absent this the SDK throws "canUseTool callback is not provided." on the
+        // first tool that needs approval, which surfaces as an opaque tool error
+        // and leaves the model narrating an approval prompt that exists nowhere.
+        canUseTool: (requestPermission || opts.requestPermission)
+          ? makeCanUseTool(session, requestPermission)
+          : undefined,
         additionalDirectories: opts.hostFolders && opts.hostFolders.length ? opts.hostFolders : undefined,
         mcpServers,
         strictMcpConfig: opts.leanCli ? true : undefined,
@@ -238,16 +318,7 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
         env: scrubbedChildEnv(opts.mcp?.env),
       },
     });
-    session = {
-      query,
-      queue,
-      sessionId: "",
-      idleTimer: null,
-      activeTurn: null,
-      closed: false,
-      terminalError: null,
-      fingerprint,
-    };
+    session.query = query;
     sessions.set(sessionKey, session);
 
     // This pump deliberately lives for the whole session. A `break` inside a
@@ -355,6 +426,13 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
         // Every fallback wants the whole turn, not just the open block.
         get text() { return this.flushed + this.streamed; },
         onData,
+        // Permission context: which conversation a request posts into, and what
+        // the workspace has already granted this agent permanently. Held on the
+        // TURN, not the session, because a pooled session serves many jobs and
+        // the rules ride in on each job's payload.
+        jobId: opts.job?.id || "",
+        permissionRules: jobPermissionRules(opts.job),
+        requestPermission: opts.requestPermission || null,
         finish(value) {
           if (settled) return;
           settled = true;
@@ -459,9 +537,53 @@ function mapCodexApproval(permissionMode) {
 }
 
 /**
- * @param {{ spawnFn?: Function, idleCloseMs?: number }} [opts]
+ * Pick a decision string Codex will actually accept.
+ *
+ * `CommandExecutionRequestApprovalParams.availableDecisions` is "the ordered
+ * list of decisions the client may present for this prompt" — reading it beats
+ * hard-coding an enum that moves between codex-cli releases. `preferences` is
+ * ordered best-first; `fallback` is used when the server sent no list at all,
+ * and is deliberately a value this codebase has already exchanged with a live
+ * app-server rather than the one we'd rather have.
+ *
+ * Consequence worth knowing: against an app-server too old to advertise its
+ * decisions, an "allow once" is delivered as `acceptForSession`, because there
+ * is no narrower value we can be sure it understands and the human did say yes.
+ * codex-cli 0.145.0 — the version this executor was verified against — sends
+ * the list, so this only bites older servers.
  */
-export function createCodexAppServerExecutor({ spawnFn = spawn, idleCloseMs = DEFAULT_IDLE_CLOSE_MS } = {}) {
+function pickCodexDecision(availableDecisions, preferences, fallback) {
+  const available = Array.isArray(availableDecisions) ? availableDecisions.map(String) : [];
+  if (available.length) {
+    const match = preferences.find((candidate) => available.includes(candidate));
+    if (match) return match;
+  }
+  return fallback;
+}
+
+const CODEX_DECLINE = { preferences: ["decline"], fallback: "decline" };
+const CODEX_ALLOW_ONCE = { preferences: ["accept", "acceptForSession"], fallback: "acceptForSession" };
+const CODEX_ALLOW_SESSION = { preferences: ["acceptForSession", "accept"], fallback: "acceptForSession" };
+
+function codexDecision(availableDecisions, choice) {
+  return pickCodexDecision(availableDecisions, choice.preferences, choice.fallback);
+}
+
+/** One line describing what Codex is asking to do, for the human reading the prompt. */
+function summarizeCodexApproval(method, params) {
+  const command = params?.command;
+  const line = Array.isArray(command) ? command.join(" ") : String(command || "");
+  if (line.trim()) return line.replace(/\s+/g, " ").trim().slice(0, 200);
+  const changes = params?.fileChanges || params?.changes;
+  const paths = changes && typeof changes === "object" ? Object.keys(changes) : [];
+  if (paths.length) return paths.slice(0, 4).join(", ");
+  return method === "item/fileChange/requestApproval" ? "apply a file change" : "run a command";
+}
+
+/**
+ * @param {{ spawnFn?: Function, idleCloseMs?: number, requestPermission?: Function }} [opts]
+ */
+export function createCodexAppServerExecutor({ spawnFn = spawn, idleCloseMs = DEFAULT_IDLE_CLOSE_MS, requestPermission } = {}) {
   const sessions = new Map(); // sessionKey -> { child, rpc, threadId, idleTimer }
   const withLock = createKeyedMutex();
 
@@ -533,17 +655,42 @@ export function createCodexAppServerExecutor({ spawnFn = spawn, idleCloseMs = DE
 
       const offMessage = session.rpc.onMessage((method, params, requestId) => {
         if (requestId !== undefined) {
-          if (method === "item/commandExecution/requestApproval") {
-            const decision = opts.permissionMode === "yolo" ? "acceptForSession" : "decline";
-            session.rpc.respond(requestId, { decision });
-          } else if (method === "item/fileChange/requestApproval") {
-            const decision = opts.permissionMode === "yolo" || opts.permissionMode === "accept_edits"
-              ? "acceptForSession"
-              : "decline";
-            session.rpc.respond(requestId, { decision });
-          } else {
+          const isCommand = method === "item/commandExecution/requestApproval";
+          const isFileChange = method === "item/fileChange/requestApproval";
+          if (!isCommand && !isFileChange) {
             session.rpc.respondError(requestId, `Agensis daemon cannot handle Codex request ${method}`);
+            return;
           }
+          // The permission mode can still answer without a human: yolo clears
+          // everything, and accept_edits is exactly a standing yes to file
+          // changes. Only what neither covers is worth interrupting someone for.
+          const preCleared = opts.permissionMode === "yolo" || (isFileChange && opts.permissionMode === "accept_edits");
+          const ask = opts.requestPermission || requestPermission;
+          if (preCleared || !ask) {
+            // Without a broker this stays the old hard decline rather than a
+            // silent grant — an agent that cannot ask must not self-approve.
+            const decision = codexDecision(params?.availableDecisions, preCleared ? CODEX_ALLOW_SESSION : CODEX_DECLINE);
+            session.rpc.respond(requestId, { decision });
+            return;
+          }
+          // Codex offers no per-rule "always allow" the way the Claude SDK's
+          // `suggestions` do, so no rule is passed and the broker offers only
+          // once/session. Inventing a permanent rule here would mean storing
+          // "this agent may run any command" behind an innocuous click.
+          void Promise.resolve(ask({
+            jobId: opts.job?.id || "",
+            toolName: isCommand ? "Codex command" : "Codex file change",
+            detail: summarizeCodexApproval(method, params),
+            description: String(params?.reason || "").trim(),
+            input: params || null,
+          })).then((outcome) => {
+            const choice = outcome?.behavior !== "allow" ? CODEX_DECLINE
+              : outcome.scope === "once" ? CODEX_ALLOW_ONCE
+                : CODEX_ALLOW_SESSION;
+            session.rpc.respond(requestId, { decision: codexDecision(params?.availableDecisions, choice) });
+          }).catch(() => {
+            session.rpc.respond(requestId, { decision: codexDecision(params?.availableDecisions, CODEX_DECLINE) });
+          });
           return;
         }
         if (!params || params.threadId !== session.threadId) return;
