@@ -124,6 +124,7 @@ Options:
   --handle <name>         Mention handle used in channels
   --name <name>           Display name
   --cwd <path>            Folder where the coding CLI runs
+  --runtime <runtime>     Executor runtime: claude, codex, or amp
   --host-folder <path>    Extra folder the coding CLI may read/write (repeatable; passed as --add-dir)
   --coding-cmd <command>  Command used for jobs, default: claude -p
   --amp-cmd <path>        Amp CLI executable, default: amp

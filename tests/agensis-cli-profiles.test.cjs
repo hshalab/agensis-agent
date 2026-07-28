@@ -33,6 +33,7 @@ test('daemon profiles persist a complete main agent connect command securely', a
       handle: 'mac',
       name: 'mac',
       cwd: '/Users/example/projects/sample-app',
+      runtime: 'amp',
       model: 'claude-opus-4-8',
       permissionMode: 'accept_edits',
       share: true,
@@ -54,6 +55,7 @@ test('daemon profiles persist a complete main agent connect command securely', a
       handle: 'mac',
       name: 'mac',
       cwd: '/Users/example/projects/sample-app',
+      runtime: 'amp',
       model: 'claude-opus-4-8',
       permissionMode: 'accept_edits',
       share: true,
@@ -96,6 +98,29 @@ test('full CLI context opt-out survives the saved-profile merge path', async () 
   }, { fullCliContext: true });
   const normalized = agentTest.normalizeConfig(merged);
   assert.equal(normalized.leanCli, false);
+});
+
+test('runtime selection is bounded and legacy profiles infer it from their coding command', async () => {
+  const { __test: agentTest } = await import(agentModuleUrl);
+  const base = { url: 'https://agensis.test', token: 'aga_secret', workspace: 'workspace-1', agent: 'agent-1' };
+
+  assert.equal(agentTest.normalizeConfig({ ...base, runtime: 'amp' }).runtime, 'amp');
+  assert.equal(agentTest.normalizeConfig({ ...base, runtime: 'amp' }).codingCmd, '', 'Amp profiles have no Claude/Codex fallback command');
+  assert.equal(agentTest.normalizeConfig({ ...base, runtime: 'amp' }).model, '', 'Amp chooses its model inside Amp');
+  const codex = agentTest.normalizeConfig({ ...base, runtime: 'codex' });
+  assert.equal(codex.runtime, 'codex');
+  assert.equal(codex.codingCmd, 'codex exec');
+  assert.equal(codex.model, '', 'Codex default must not become a Claude model id');
+  assert.equal(agentTest.normalizeConfig({ ...base, codingCmd: 'codex exec' }).runtime, 'codex');
+  assert.equal(agentTest.normalizeConfig({ ...base, runtime: 'codex', model: 'gpt-5.4' }).model, 'gpt-5.4');
+  assert.equal(agentTest.normalizeConfig({ ...base, codingCmd: '/opt/bin/claude -p' }).runtime, 'claude');
+  assert.equal(agentTest.normalizeConfig({ ...base, ampCmd: '/opt/bin/amp' }).runtime, 'claude', '--amp-cmd configures discovery but does not select Amp');
+  assert.equal(agentTest.normalizeConfig({ ...base, runtime: 'claude' }).model, 'claude-opus-4-8');
+  assert.equal(agentTest.normalizeConfig({ ...base, codingCmd: './my-runner' }).runtime, 'custom');
+  assert.throws(
+    () => agentTest.normalizeConfig({ ...base, runtime: 'shell' }),
+    /--runtime must be one of: claude, codex, amp/,
+  );
 });
 
 test('legacy profiles migrate the old persisted concurrency default from eight to two', async () => {

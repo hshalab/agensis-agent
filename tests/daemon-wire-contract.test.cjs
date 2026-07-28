@@ -49,6 +49,7 @@ test('daemon honors the hub auth, register, job, delta, and result contract', { 
             assert.equal(frame.workspaceId, 'workspace-wire');
             assert.equal(frame.agentId, 'agent-wire');
             assert.equal(frame.metadata.runtime, 'agensis');
+            assert.equal(frame.metadata.executionRuntime, 'custom');
             assert.deepEqual(frame.identity, {
               avatar: 'FX',
               description: 'Wire contract test agent',

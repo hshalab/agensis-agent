@@ -61,6 +61,7 @@ Optional:
 - `--handle <name>`: mention handle used in channels
 - `--name <name>`: display name
 - `--cwd <path>`: folder where the coding CLI runs
+- `--runtime <runtime>`: lock this profile to `claude`, `codex`, or `amp`
 - `--coding-cmd <command>`: command used for jobs, default `claude -p`
 - `--amp-cmd <path>`: Amp CLI executable used by Amp Orb agents, default `amp`
 - `--no-coding`: disable coding jobs while keeping presence or shared inference online
@@ -88,6 +89,7 @@ Environment fallbacks:
 - `AGENSIS_HANDLE`
 - `AGENSIS_NAME`
 - `AGENSIS_CWD`
+- `AGENSIS_RUNTIME`
 - `AGENSIS_CODING_CMD` or `CODING_CMD`
 - `AGENSIS_AMP_CMD`
 - `AGENSIS_NO_CODING=1`
@@ -103,7 +105,7 @@ Environment fallbacks:
 
 Create an **Amp Orb** agent from the Agensis template gallery, then connect that
 agent from the repository it should work on using the normal copied `agensis
-connect` command. The daemon uses the Amp CLI on this machine to start a fresh
+connect --runtime amp` command. The daemon uses the Amp CLI on this machine to start a fresh
 orb for the first message in an Agensis conversation and continues the exact Amp
 thread for later messages in that conversation.
 
@@ -126,6 +128,11 @@ token. Missing CLI, unsupported versions, signed-out or expired accounts,
 project access, setup, credit, provisioning, cancellation, timeout, and missing
 thread failures are returned to the Agensis conversation as explicit errors;
 an Amp agent never falls back to another coding CLI.
+
+Committed repository guidance and skills are cloned into the orb with the
+repository. That includes `AGENTS.md` and skills under `.agents/skills` or
+`.claude/skills`. Host-global skills and skill bodies stored only in Agensis are
+not copied into an orb; move any required skill into the repository first.
 
 ## Share Local Inference
 

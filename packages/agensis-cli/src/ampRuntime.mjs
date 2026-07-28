@@ -11,6 +11,7 @@ const FAILURE_MESSAGES = {
   amp_not_authenticated: 'Amp is not signed in on the connected machine. Run `amp login` there, then try again.',
   amp_auth_expired: 'The Amp sign-in on the connected machine has expired. Run `amp login` there, then try again.',
   amp_project_not_found: 'This repository is not an Amp project. Create or join its Amp project, then try again.',
+  amp_project_unmatched: 'This repository is not linked to an Amp project. Create or join its Amp project, then try again.',
   amp_project_forbidden: 'The connected Amp account cannot access this repository project.',
   amp_repo_not_allowed: 'This repository is not allowed by the connected Agensis daemon profile.',
   amp_insufficient_credit: 'The connected Amp account does not have enough credit to start or continue this orb.',
@@ -188,6 +189,7 @@ export async function probeAmpRuntime({ cwd, executable = 'amp', run = runCli, s
   if (['forbidden', 'permission_denied', 'access_denied'].includes(String(status?.status || '').toLowerCase())) {
     return runtimeUnavailable(version, 'amp_project_forbidden');
   }
+  if (status?.status === 'unmatched') return runtimeUnavailable(version, 'amp_project_unmatched');
   if (status?.status !== 'matched' || !status?.project) return runtimeUnavailable(version, 'amp_project_not_found');
   return { id: AMP_RUNTIME_ID, available: true, version, reason: null, project: safeProject(status.project) };
 }

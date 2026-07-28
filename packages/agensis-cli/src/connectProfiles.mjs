@@ -14,6 +14,7 @@ const PROFILE_KEYS = [
   "handle",
   "name",
   "cwd",
+  "runtime",
   "codingCmd",
   "ampCmd",
   "model",

@@ -342,6 +342,7 @@ export async function runAgensisDaemon(rawConfig = {}) {
           permissionFlags: permissionFlagsForMode(config.permissionMode),
           once: config.once,
           runtime: "agensis",
+          executionRuntime: config.runtime,
           version: AGENSIS_CLI_VERSION,
         },
       });
@@ -633,6 +634,15 @@ function normalizeConfig(raw) {
     booleanOption(process.env.AGENSIS_FULL_CLI_CONTEXT, false),
   );
   const leanCli = !fullCliContext && booleanOption(raw.leanCli, true);
+  const runtimeInput = String(raw.runtime || process.env.AGENSIS_RUNTIME || "").trim().toLowerCase();
+  if (runtimeInput && !["claude", "codex", "amp"].includes(runtimeInput)) {
+    throw new Error("--runtime must be one of: claude, codex, amp");
+  }
+  const defaultCodingCmd = runtimeInput === "codex" ? "codex exec" : "claude -p";
+  const configuredCodingCmd = codingDisabled || runtimeInput === "amp"
+    ? ""
+    : String(raw.codingCmd || process.env.AGENSIS_CODING_CMD || process.env.CODING_CMD || defaultCodingCmd).trim();
+  const executionRuntime = runtimeInput || inferExecutionRuntime(configuredCodingCmd);
   const config = {
     url: String(raw.url || raw.baseUrl || process.env.AGENSIS_URL || "").trim(),
     token: String(raw.token || process.env.AGENSIS_TOKEN || "").trim(),
@@ -641,9 +651,11 @@ function normalizeConfig(raw) {
     handle: slugHandle(raw.handle || process.env.AGENSIS_HANDLE || raw.name || process.env.AGENSIS_NAME || "agent"),
     name: String(raw.name || process.env.AGENSIS_NAME || raw.handle || process.env.AGENSIS_HANDLE || "agensis Agent").trim(),
     cwd: String(raw.cwd || process.env.AGENSIS_CWD || process.cwd()).trim(),
-    codingCmd: codingDisabled ? "" : String(raw.codingCmd || process.env.AGENSIS_CODING_CMD || process.env.CODING_CMD || "claude -p").trim(),
+    codingCmd: configuredCodingCmd,
+    runtime: executionRuntime,
+    runtimeLocked: Boolean(runtimeInput),
     ampCmd: String(raw.ampCmd || process.env.AGENSIS_AMP_CMD || "amp").trim() || "amp",
-    model: resolveModel(raw.model || process.env.AGENSIS_MODEL || process.env.CLAUDE_MODEL || ""),
+    model: resolveExecutionModel(raw.model || process.env.AGENSIS_MODEL || process.env.CLAUDE_MODEL || "", executionRuntime),
     permissionMode: normalizePermissionMode(raw.permissionMode || raw.permission_mode || raw.permission || process.env.AGENSIS_PERMISSION_MODE || "default"),
     timeoutMs: Number(raw.timeoutMs || process.env.AGENSIS_TIMEOUT_MS || DEFAULT_TIMEOUT_MS),
     heartbeatMs: Number(raw.heartbeatMs || process.env.AGENSIS_HEARTBEAT_MS || DEFAULT_HEARTBEAT_MS),
@@ -926,6 +938,21 @@ async function runCursorBuddyControlJob(config, job, intent, started) {
 async function runAgentJob(config, job, { signal, requestPermission = null }) {
   const started = Date.now();
   log(`Starting job ${job.id}`);
+  const jobRuntime = executionRuntimeForJob(config, job);
+  if (config.runtimeLocked && jobRuntime !== config.runtime) {
+    const error = `Executor runtime ${config.runtime} cannot accept job runtime ${jobRuntime}.`;
+    send(job.ws, {
+      action: "agent_job_result",
+      jobId: job.id,
+      response: "",
+      error,
+      errorCode: "runtime_mismatch",
+      elapsedMs: Date.now() - started,
+      metadata: { executionRuntime: config.runtime },
+    });
+    log(`Job ${job.id} refused: runtime mismatch (${config.runtime} != ${jobRuntime})`);
+    return;
+  }
   if (isAmpJob(job)) {
     await runAmpAgentJob(config, job, { signal, started });
     if (config.once) {
@@ -1389,6 +1416,28 @@ function buildAgentCommand(config, job) {
   return { cmd, args, model, permissionMode, permissionFlags };
 }
 
+function inferExecutionRuntime(codingCmd) {
+  if (!String(codingCmd || "").trim()) return "custom";
+  let cmd;
+  try {
+    ({ cmd } = splitCommand(codingCmd));
+  } catch {
+    return "custom";
+  }
+  if (isClaudeCommand(cmd)) return "claude";
+  if (isCodexCommand(cmd)) return "codex";
+  return "custom";
+}
+
+function executionRuntimeForJob(config, job) {
+  if (isAmpJob(job)) return "amp";
+  const declared = String(job?.agent?.metadata?.executionRuntime || job?.agent?.metadata?.runtime || "")
+    .trim()
+    .toLowerCase();
+  if (["claude", "codex", "amp", "custom"].includes(declared)) return declared;
+  return config.runtime === "amp" ? "custom" : config.runtime;
+}
+
 function leanMcpRuntime(config) {
   const url = agentBackendUrl(config.url);
   url.pathname = "/backend/mcp";
@@ -1544,13 +1593,24 @@ function createStreamJsonParser({ onStep, onSegment } = {}) {
 }
 
 function resolveJobModel(config, job) {
-  return resolveModel(job?.agent?.model || job?.model || config.model);
+  return resolveExecutionModel(
+    job?.agent?.model || job?.model || config.model,
+    executionRuntimeForJob(config, job),
+  );
 }
 
 function resolveModel(value) {
   const text = String(value || "").trim();
   if (!text || text === "auto" || text === "claude-fable-5") return DEFAULT_MODEL;
   return text;
+}
+
+function resolveExecutionModel(value, runtime) {
+  const text = String(value || "").trim();
+  if (runtime === "codex" || runtime === "amp") {
+    return !text || text === "auto" ? "" : text;
+  }
+  return resolveModel(text);
 }
 
 function resolveJobPermissionMode(config, job) {
@@ -1749,7 +1809,7 @@ function applyAgentConfig(config, agent) {
   if (!agent || typeof agent !== "object") return;
   if (agent.name) config.name = String(agent.name).trim() || config.name;
   if (agent.handle || agent.name) config.handle = slugHandle(agent.handle || agent.name || config.handle);
-  if (agent.model) config.model = resolveModel(agent.model);
+  if (agent.model) config.model = resolveExecutionModel(agent.model, config.runtime);
   const permissionMode = agent.permissionMode || agent.permission_mode;
   if (permissionMode) config.permissionMode = normalizePermissionMode(permissionMode);
   if (agent.memory_dir !== undefined || agent.memoryDir !== undefined) {
@@ -1813,7 +1873,11 @@ async function computeCapabilities(config, reach = null) {
   // no second sync channel.
   const sharedModels = sharedModelAdvertisements(config.sharedModels);
   const amp = await cachedAmpRuntimeCapability(config);
-  const runtimes = { amp };
+  const runtimes = {
+    claude: { id: "claude", label: "Claude", available: clis.includes("claude") },
+    codex: { id: "codex", label: "Codex", available: clis.includes("codex") },
+    amp: { ...amp, label: "Amp" },
+  };
   const capabilitiesHash = sha1Short(JSON.stringify({ skills, commands, clis, mcpServers, memoryRoot, sharedModels, runtimes, codingRoute: Boolean(config.codingCmd), shared: config.share, reach: reach || null }));
   const memoryHash = sha1Short(await memoryFingerprint(memoryRoot));
   // Deliberately NOT folded into capabilitiesHash: a skill body edit should re-push

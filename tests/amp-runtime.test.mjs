@@ -106,7 +106,7 @@ test('Amp preflight distinguishes unsupported CLI capabilities, auth, and projec
     { status: 0, stdout: JSON.stringify({ status: 'unmatched', project: null }), stderr: '', error: null },
   ];
   const project = await amp.probeAmpRuntime({ cwd: process.cwd(), run: async () => unmatched.shift() });
-  assert.equal(project.reason, 'amp_project_not_found');
+  assert.equal(project.reason, 'amp_project_unmatched');
 
   const forbidden = [
     { status: 0, stdout: '0.0.test', stderr: '', error: null },
@@ -174,11 +174,23 @@ test('daemon streams new and continued Amp turns and never launches its configur
       cwd: temp,
       codingCmd: fallback,
       ampCmd: fakeAmp,
+      runtime: 'amp',
       heartbeatMs: 0,
     });
     const capabilities = await daemon.computeCapabilities(config);
+    assert.deepEqual(capabilities.runtimes.claude, {
+      id: 'claude',
+      label: 'Claude',
+      available: capabilities.clis.includes('claude'),
+    });
+    assert.deepEqual(capabilities.runtimes.codex, {
+      id: 'codex',
+      label: 'Codex',
+      available: capabilities.clis.includes('codex'),
+    });
     assert.deepEqual(capabilities.runtimes.amp, {
       id: 'amp',
+      label: 'Amp',
       available: true,
       version: '0.0.fake',
       reason: null,
@@ -243,4 +255,21 @@ test('daemon streams new and continued Amp turns and never launches its configur
   } finally {
     await fs.rm(temp, { recursive: true, force: true });
   }
+});
+
+test('runtime-locked profiles refuse mismatched jobs before command or executor fallback', async () => {
+  const { __test: daemon } = await import('../packages/agensis-cli/src/agensis.mjs');
+  const sent = [];
+  const ws = { readyState: 1, send: payload => sent.push(JSON.parse(payload)) };
+  const base = { url: 'https://agents.example.test', token: 'aga_test', workspace: 'workspace-1', agent: 'agent-1' };
+
+  const ampConfig = daemon.normalizeConfig({ ...base, runtime: 'amp', codingCmd: 'this-fallback-must-not-run' });
+  assert.equal(ampConfig.codingCmd, '', 'an Amp-locked profile cannot initialize a fallback coding executor');
+  await daemon.runAgentJob(ampConfig, { id: 'normal', prompt: 'normal', agent: { metadata: {} }, ws }, { signal: new AbortController().signal });
+  assert.match(sent.at(-1).error, /runtime amp cannot accept job runtime custom/);
+
+  sent.length = 0;
+  const claudeConfig = daemon.normalizeConfig({ ...base, runtime: 'claude', codingCmd: 'claude -p' });
+  await daemon.runAgentJob(claudeConfig, { id: 'amp', prompt: 'amp', agent: { metadata: { runtime: 'amp' } }, ws }, { signal: new AbortController().signal });
+  assert.match(sent.at(-1).error, /runtime claude cannot accept job runtime amp/);
 });
