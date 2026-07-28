@@ -212,7 +212,7 @@ function makeCanUseTool(session, fallbackRequester) {
     if (!requestPermission) {
       return { behavior: "deny", message: "This agent has no way to ask for approval right now." };
     }
-    if (isAllowedByStoredRules(turn.permissionRules, { toolName, suggestions: context.suggestions })) {
+    if (isAllowedByStoredRules(turn.permissionRules, { toolName, input, suggestions: context.suggestions })) {
       return { behavior: "allow" };
     }
     const decision = await requestPermission({

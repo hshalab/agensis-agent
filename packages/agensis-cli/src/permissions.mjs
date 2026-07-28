@@ -90,6 +90,64 @@ export function suggestionRuleKeys(suggestions) {
   return keys;
 }
 
+// Stream redirections, removed BEFORE the chaining test below. `2>&1` and `&>`
+// contain an `&` while running no second command, and treating them as chaining
+// refused a rule for `git clone <url> 2>&1` — one of the most ordinary commands
+// there is, and the one that first exposed this.
+const SHELL_REDIRECT = /\d*>&\d*|&>/g;
+
+// Shell syntax that CHAINS a second command onto the first. A prefix rule over
+// one of these is a trap: `Bash(cd foo:*)` reads as "let it cd into foo" and
+// actually matches `cd foo && rm -rf /`. Command substitution counts too — the
+// prefix says nothing about what runs inside `$(…)`.
+const SHELL_CHAINING = /[;&|`]|\$\(/;
+
+/**
+ * A rule for this call when the CLI offered none.
+ *
+ * The SDK is supposed to hand `canUseTool` the exact rules its own "always
+ * allow" would write, and when it does we use those verbatim. It frequently
+ * sends nothing at all — and because the same suggestions were the ONLY input
+ * to rule matching, that made permanent grants inert end-to-end: no button to
+ * grant one, and no way for a stored one to ever match. Synthesizing our own is
+ * what makes the tier exist.
+ *
+ * Self-consistency, not fidelity to Claude, is what makes this safe: the key
+ * stored on the agent and the key compared on a later call both come from HERE,
+ * so they cannot disagree. The exact string is shown in the approval card, so
+ * nobody grants a rule they did not read.
+ *
+ * Only `Bash`, and only for a single command. A prefix rule over a chained
+ * command grants everything after the chain operator, and no other tool has a
+ * content shape we can narrow honestly — a whole-tool `Write` rule is "write any
+ * file, forever", which is not what an "always allow" click next to one path
+ * means. Both cases return nothing, so the request offers once/session only,
+ * which is the truthful set.
+ */
+export function synthesizedRuleKeys(toolName, input) {
+  if (String(toolName || "") !== "Bash") return [];
+  const command = String(input?.command ?? "").trim();
+  if (!command || SHELL_CHAINING.test(command.replace(SHELL_REDIRECT, " "))) return [];
+  const tokens = command.split(/\s+/);
+  const head = tokens[0];
+  if (!head || head.startsWith("-")) return [];
+  // A subcommand only when it looks like one: `git clone`, not `git -C` and not
+  // `cat ./secrets`. Anything else narrows to the bare program.
+  const next = tokens[1];
+  const prefix = next && /^[a-z][a-z0-9:_-]*$/i.test(next) ? `${head} ${next}` : head;
+  return [`Bash(${prefix}:*)`];
+}
+
+/**
+ * Every rule an "always allow" on this request would store: the CLI's own
+ * suggestions when it sent any, ours otherwise. One function so the request and
+ * the later match can never compute different keys.
+ */
+export function requestRuleKeys({ toolName, input, suggestions } = {}) {
+  const offered = suggestionRuleKeys(suggestions);
+  return offered.length > 0 ? offered : synthesizedRuleKeys(toolName, input);
+}
+
 /**
  * Stored rules for a job, from `workspace_agents.metadata.permission_rules`.
  *
@@ -121,16 +179,16 @@ export function jobPermissionRules(job) {
  * Is this request already covered by a rule the human granted permanently?
  *
  * Whole-tool rules (`WebFetch`, no content) match any request for that tool —
- * that is what a content-free rule means. Everything else must be an exact
- * match against a rule the SDK is offering for THIS call, per the note at the
- * top of the file.
+ * that is what a content-free rule means. Everything else is compared against
+ * the keys THIS call would store, via the same `requestRuleKeys` the request
+ * used, so a granted rule and its later match can never be computed differently.
  */
-export function isAllowedByStoredRules(storedKeys, { toolName, suggestions } = {}) {
+export function isAllowedByStoredRules(storedKeys, { toolName, input, suggestions } = {}) {
   const stored = Array.isArray(storedKeys) ? storedKeys : [];
   if (stored.length === 0) return false;
   const tool = String(toolName || "").trim();
   if (tool && stored.includes(tool)) return true;
-  return suggestionRuleKeys(suggestions).some((key) => stored.includes(key));
+  return requestRuleKeys({ toolName, input, suggestions }).some((key) => stored.includes(key));
 }
 
 /** A denial the model can act on, rather than an opaque tool error. */
@@ -171,7 +229,7 @@ export function createPermissionBroker({
      */
     request({ jobId, toolName, title, description, detail, input, suggestions, signal } = {}) {
       const requestId = idFactory();
-      const ruleKeys = suggestionRuleKeys(suggestions);
+      const ruleKeys = requestRuleKeys({ toolName, input, suggestions });
       const delivered = send({
         action: "agent_permission_request",
         jobId: jobId || "",

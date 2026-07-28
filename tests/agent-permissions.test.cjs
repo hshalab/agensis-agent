@@ -55,6 +55,89 @@ test('only allow-rules are harvested from suggestions — never a mode flip or a
   assert.deepEqual(keys, ['Bash(git clone:*)']);
 });
 
+// --- rule synthesis ---------------------------------------------------------
+//
+// The CLI frequently sends NO `permission_suggestions` at all. Since those
+// suggestions were the only input to both the "always allow" button and to rule
+// matching, permanent grants were inert end-to-end: no way to make one, and no
+// way for one to ever match. These synthesize the rule ourselves.
+
+test('a simple command gets a prefix rule, and a redirect does not disqualify it', async () => {
+  const { requestRuleKeys } = await loadPermissions();
+  const rules = (command) => requestRuleKeys({ toolName: 'Bash', input: { command } });
+
+  assert.deepEqual(rules('git clone https://github.com/x/y'), ['Bash(git clone:*)']);
+  // `2>&1` contains an `&` but runs no second command. Treating it as chaining
+  // refused a rule for the most ordinary command there is — and was exactly the
+  // case that exposed this.
+  assert.deepEqual(rules('git clone https://github.com/x/y 2>&1'), ['Bash(git clone:*)']);
+  assert.deepEqual(rules('npm test > out.log 2>&1'), ['Bash(npm test:*)']);
+  assert.deepEqual(rules('ls -la'), ['Bash(ls:*)']);
+  // A flag is not a subcommand, so the rule narrows to the bare program rather
+  // than inventing `git -C` as a thing to grant.
+  assert.deepEqual(rules('git -C /tmp status'), ['Bash(git:*)']);
+});
+
+test('a chained command gets NO rule, because a prefix over one grants what follows', async () => {
+  const { requestRuleKeys } = await loadPermissions();
+  const rules = (command) => requestRuleKeys({ toolName: 'Bash', input: { command } });
+
+  // `Bash(cd foo:*)` reads as "let it cd into foo" and matches
+  // `cd foo && rm -rf /`. Offering no rule means the request falls back to
+  // once/session, which is the truthful set.
+  assert.deepEqual(rules('cd agensis-agent && echo x && ls -la'), []);
+  assert.deepEqual(rules('echo hi | grep h'), []);
+  assert.deepEqual(rules('rm -rf /tmp/x; echo done'), []);
+  assert.deepEqual(rules('sleep 5 &'), []);
+  assert.deepEqual(rules('cat $(cat /etc/passwd)'), []);
+  assert.deepEqual(rules('echo `whoami`'), []);
+  assert.deepEqual(rules(''), []);
+});
+
+test('no tool other than Bash gets a synthesized rule', async () => {
+  const { requestRuleKeys } = await loadPermissions();
+  // A whole-tool `Write` rule means "write any file, forever", which is not what
+  // an "always allow" click sitting next to one path means.
+  assert.deepEqual(requestRuleKeys({ toolName: 'Write', input: { file_path: '/root/x' } }), []);
+  assert.deepEqual(requestRuleKeys({ toolName: 'WebFetch', input: { url: 'https://x' } }), []);
+});
+
+test('a rule the CLI offered always wins over one we would synthesize', async () => {
+  const { requestRuleKeys } = await loadPermissions();
+  // Its own suggestion is authoritative about its own matching semantics; ours
+  // is only the fallback for when it sends nothing.
+  assert.deepEqual(
+    requestRuleKeys({ toolName: 'Bash', input: { command: 'git clone https://x/y' }, suggestions: bashCloneSuggestions }),
+    ['Bash(git clone:*)'],
+  );
+  assert.deepEqual(
+    requestRuleKeys({
+      toolName: 'Bash',
+      input: { command: 'ls -la' },
+      suggestions: [{ type: 'addRules', behavior: 'allow', destination: 'session', rules: [{ toolName: 'Bash', ruleContent: 'ls -la' }] }],
+    }),
+    ['Bash(ls -la)'],
+  );
+});
+
+test('a synthesized grant matches the next call, which is what makes "always" real', async () => {
+  const { isAllowedByStoredRules, requestRuleKeys } = await loadPermissions();
+  // The key stored on the agent and the key compared later both come from
+  // requestRuleKeys, so they cannot disagree. Without this the button could be
+  // clicked and the rule would still never match.
+  const stored = requestRuleKeys({ toolName: 'Bash', input: { command: 'git clone https://x/y' } });
+  assert.deepEqual(stored, ['Bash(git clone:*)']);
+
+  assert.equal(
+    isAllowedByStoredRules(stored, { toolName: 'Bash', input: { command: 'git clone https://other/repo 2>&1' } }),
+    true,
+  );
+  // A different command is a different permission and must still be asked.
+  assert.equal(isAllowedByStoredRules(stored, { toolName: 'Bash', input: { command: 'git push origin main' } }), false);
+  // And the grant must not leak onto a chained command that merely starts the same.
+  assert.equal(isAllowedByStoredRules(stored, { toolName: 'Bash', input: { command: 'git clone https://x/y && rm -rf /' } }), false);
+});
+
 test('stored rules are read from either the canonical strings or raw rule objects', async () => {
   const { normalizeStoredRules, jobPermissionRules } = await loadPermissions();
   assert.deepEqual(normalizeStoredRules(['Bash(git clone:*)', 'Bash(git clone:*)']), ['Bash(git clone:*)']);
