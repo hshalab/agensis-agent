@@ -20,7 +20,7 @@
     ".": "./src/agensis.mjs"
   },
   "scripts": {
-    "check": "node --check bin/agensis.mjs && node --check src/agensis.mjs && node --check src/cli.mjs && node --check src/queue.mjs && node --check src/memory.mjs && node --check src/skills.mjs && node --check src/slashEnum.mjs && node --check src/setupFlow.mjs && node --check src/cursorbuddyLocalBridge.mjs && node --check src/sharedInference.mjs && node --check src/executor.mjs && node --check src/connectionExecutors.mjs && node --check src/sandbox/e2b.mjs && node --check src/state.mjs && node --check src/selfUpdate.mjs && node --check src/supervise.mjs",
+    "check": "node --check bin/agensis.mjs && node --check src/agensis.mjs && node --check src/ampRuntime.mjs && node --check src/cli.mjs && node --check src/queue.mjs && node --check src/memory.mjs && node --check src/skills.mjs && node --check src/slashEnum.mjs && node --check src/setupFlow.mjs && node --check src/cursorbuddyLocalBridge.mjs && node --check src/sharedInference.mjs && node --check src/executor.mjs && node --check src/connectionExecutors.mjs && node --check src/sandbox/e2b.mjs && node --check src/state.mjs && node --check src/selfUpdate.mjs && node --check src/supervise.mjs",
     "link": "npm link && bun link",
     "pack:dry-run": "npm pack --dry-run",
     "prepack": "npm run check",
@@ -29,6 +29,7 @@
   "files": [
     "bin/agensis.mjs",
     "src/agensis.mjs",
+    "src/ampRuntime.mjs",
     "src/cli.mjs",
     "src/executor.mjs",
     "src/connectionExecutors.mjs",

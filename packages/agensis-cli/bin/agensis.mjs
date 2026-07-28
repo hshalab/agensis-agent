@@ -126,6 +126,7 @@ Options:
   --cwd <path>            Folder where the coding CLI runs
   --host-folder <path>    Extra folder the coding CLI may read/write (repeatable; passed as --add-dir)
   --coding-cmd <command>  Command used for jobs, default: claude -p
+  --amp-cmd <path>        Amp CLI executable, default: amp
   --no-coding             Disable coding jobs; keep presence/shared inference only
   --full-cli-context      Load all user CLI skills, plugins, hooks, memory, and MCPs
                           (default isolates Claude/Codex to project + Agensis context)

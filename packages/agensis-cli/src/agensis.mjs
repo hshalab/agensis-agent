@@ -5,6 +5,17 @@ import crypto from "node:crypto";
 import process from "node:process";
 import WebSocket from "ws";
 import { createExecutor } from "./executor.mjs";
+import { runCli } from "./cli.mjs";
+import {
+  ampFailureError,
+  assertAmpRepo,
+  buildAmpCommand,
+  createAmpError,
+  createAmpStreamTracker,
+  isAmpJob,
+  probeAmpRuntime,
+  validAmpThreadId,
+} from "./ampRuntime.mjs";
 import { summarizeToolInput } from "./connectionExecutors.mjs";
 import { createQueue } from "./queue.mjs";
 import { startCursorBuddyLocalBridge } from "./cursorbuddyLocalBridge.mjs";
@@ -569,6 +580,7 @@ function normalizeConfig(raw) {
     name: String(raw.name || process.env.AGENSIS_NAME || raw.handle || process.env.AGENSIS_HANDLE || "agensis Agent").trim(),
     cwd: String(raw.cwd || process.env.AGENSIS_CWD || process.cwd()).trim(),
     codingCmd: codingDisabled ? "" : String(raw.codingCmd || process.env.AGENSIS_CODING_CMD || process.env.CODING_CMD || "claude -p").trim(),
+    ampCmd: String(raw.ampCmd || process.env.AGENSIS_AMP_CMD || "amp").trim() || "amp",
     model: resolveModel(raw.model || process.env.AGENSIS_MODEL || process.env.CLAUDE_MODEL || ""),
     permissionMode: normalizePermissionMode(raw.permissionMode || raw.permission_mode || raw.permission || process.env.AGENSIS_PERMISSION_MODE || "default"),
     timeoutMs: Number(raw.timeoutMs || process.env.AGENSIS_TIMEOUT_MS || DEFAULT_TIMEOUT_MS),
@@ -852,6 +864,14 @@ async function runCursorBuddyControlJob(config, job, intent, started) {
 async function runAgentJob(config, job, { signal }) {
   const started = Date.now();
   log(`Starting job ${job.id}`);
+  if (isAmpJob(job)) {
+    await runAmpAgentJob(config, job, { signal, started });
+    if (config.once) {
+      log("One-shot Amp job complete; exiting.");
+      setTimeout(() => process.exit(0), 150);
+    }
+    return;
+  }
   const cursorBuddyIntent = parseCursorBuddyControlIntent(job.prompt);
   if (cursorBuddyIntent && canHandleCursorBuddyControlJobs(config)) {
     await runCursorBuddyControlJob(config, job, cursorBuddyIntent, started);
@@ -988,6 +1008,135 @@ async function runAgentJob(config, job, { signal }) {
     log("One-shot job complete; exiting.");
     setTimeout(() => process.exit(0), 150);
   }
+}
+
+async function runAmpAgentJob(config, job, { signal, started = Date.now() } = {}) {
+  const model = "amp-orb";
+  const permissionMode = "amp-managed";
+  const permissionFlags = [];
+  const sendDelta = (content = "") => send(job.ws, {
+    action: "agent_job_delta",
+    jobId: job.id,
+    content,
+    elapsedMs: Date.now() - started,
+    model,
+    permissionMode,
+    permissionFlags,
+  });
+  const sendStep = (step) => send(job.ws, {
+    action: "agent_job_step",
+    jobId: job.id,
+    kind: step.kind,
+    name: step.name,
+    detail: step.detail,
+    elapsedMs: Date.now() - started,
+  });
+  const sendSegment = (segment) => send(job.ws, {
+    action: "agent_job_segment",
+    jobId: job.id,
+    text: segment.text,
+    elapsedMs: Date.now() - started,
+  });
+  const finish = ({ response = "", error = "", errorCode = "", threadId = "" } = {}) => {
+    const ampThreadId = validAmpThreadId(threadId);
+    send(job.ws, {
+      action: "agent_job_result",
+      jobId: job.id,
+      response,
+      error,
+      errorCode: errorCode || undefined,
+      elapsedMs: Date.now() - started,
+      model,
+      permissionMode,
+      permissionFlags,
+      metadata: {
+        runtime: "amp",
+        ...(ampThreadId ? {
+          ampThreadId,
+          ampThreadUrl: `https://ampcode.com/threads/${ampThreadId}`,
+        } : {}),
+        ...(errorCode ? { ampErrorCode: errorCode } : {}),
+      },
+    });
+  };
+
+  sendDelta("");
+  const cwd = path.resolve(String(job.cwd || config.cwd));
+  const allowedRoots = [config.cwd, ...(config.hostFolders || [])];
+  try {
+    await assertAmpRepo({ cwd, allowedRoots });
+    const runtime = await probeAmpRuntime({ cwd, executable: config.ampCmd, signal });
+    if (!runtime.available) throw createAmpError(runtime.reason || "amp_cli_crashed");
+  } catch (error) {
+    const code = signal?.aborted
+      ? "amp_turn_cancelled"
+      : String(error?.code || "amp_cli_crashed");
+    finish({ error: error?.message || createAmpError(code).message, errorCode: code });
+    log(`Amp job ${job.id} refused: ${code}`);
+    return;
+  }
+
+  const requestedThreadId = String(
+    job?.runtime?.threadId || job?.ampThreadId || job?.metadata?.ampThreadId || "",
+  ).trim();
+  const existingThreadId = validAmpThreadId(requestedThreadId);
+  if ((job?.runtime?.continuationRequired === true && !existingThreadId) || (requestedThreadId && !existingThreadId)) {
+    const failure = createAmpError("amp_thread_not_found");
+    finish({ error: failure.message, errorCode: failure.code });
+    log(`Amp job ${job.id} refused: ${failure.code}`);
+    return;
+  }
+  const command = buildAmpCommand({
+    executable: config.ampCmd,
+    prompt: String(job.prompt || ""),
+    threadId: existingThreadId,
+  });
+  const parser = createStreamJsonParser({ onStep: sendStep, onSegment: sendSegment });
+  const tracker = createAmpStreamTracker();
+  let fullContent = "";
+  let lastDeltaAt = 0;
+  const progressTimer = setInterval(() => sendDelta(fullContent), 1000);
+  if (progressTimer.unref) progressTimer.unref();
+  const result = await runCli({
+    cmd: command.cmd,
+    args: command.args,
+    cwd,
+    timeoutMs: config.timeoutMs,
+    heartbeatMs: config.heartbeatMs,
+    label: "Amp orb turn",
+    signal,
+    onData: (chunk) => {
+      parser.feed(chunk);
+      tracker.feed(chunk);
+      fullContent = parser.live;
+      const now = Date.now();
+      if (now - lastDeltaAt > 150) {
+        lastDeltaAt = now;
+        sendDelta(fullContent);
+      }
+    },
+  });
+  clearInterval(progressTimer);
+  parser.end();
+  tracker.end();
+  fullContent = parser.live;
+  sendDelta(fullContent);
+
+  const threadId = tracker.threadId || existingThreadId;
+  if (result.status !== 0 || result.error) {
+    const failure = ampFailureError(result);
+    finish({ error: failure.message, errorCode: failure.code, threadId });
+    log(`Amp job ${job.id} failed: ${failure.code}`);
+    return;
+  }
+  if (!threadId) {
+    const failure = createAmpError("amp_stream_invalid");
+    finish({ error: failure.message, errorCode: failure.code });
+    log(`Amp job ${job.id} failed: ${failure.code}`);
+    return;
+  }
+  finish({ response: parser.result || "", threadId });
+  log(`Finished Amp job ${job.id} in ${Math.round((Date.now() - started) / 1000)}s (${threadId})`);
 }
 
 async function buildPrompt(config, job) {
@@ -1546,7 +1695,7 @@ function applyAgentConfig(config, agent) {
 // Detect installed skills from well-known skill directories.
 // Check which well-known CLIs are on PATH.
 function detectClis() {
-  const targets = ["claude", "codex", "gh", "node", "npm", "python3", "git", "fly", "vercel"];
+  const targets = ["amp", "claude", "codex", "gh", "node", "npm", "python3", "git", "fly", "vercel"];
   const pathDirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
   return targets.filter(cli =>
     pathDirs.some(dir => {
@@ -1598,12 +1747,32 @@ async function computeCapabilities(config, reach = null) {
   // opening/closing or an address changing re-pushes via the SAME drift nudge —
   // no second sync channel.
   const sharedModels = sharedModelAdvertisements(config.sharedModels);
-  const capabilitiesHash = sha1Short(JSON.stringify({ skills, commands, clis, mcpServers, memoryRoot, sharedModels, codingRoute: Boolean(config.codingCmd), shared: config.share, reach: reach || null }));
+  const amp = await cachedAmpRuntimeCapability(config);
+  const runtimes = { amp };
+  const capabilitiesHash = sha1Short(JSON.stringify({ skills, commands, clis, mcpServers, memoryRoot, sharedModels, runtimes, codingRoute: Boolean(config.codingCmd), shared: config.share, reach: reach || null }));
   const memoryHash = sha1Short(await memoryFingerprint(memoryRoot));
   // Deliberately NOT folded into capabilitiesHash: a skill body edit should re-push
   // bodies, not the whole capability snapshot, and the two travel on different frames.
   const skillsHash = config.syncSkills ? sha1Short(await skillsFingerprint({ cwd: config.cwd })) : null;
-  return { skills, commands, clis, mcpServers, memoryRoot, sharedModels, codingRoute: Boolean(config.codingCmd), shared: config.share, reach: reach || null, capabilitiesHash, memoryHash, skillsHash };
+  return { skills, commands, clis, mcpServers, memoryRoot, sharedModels, runtimes, codingRoute: Boolean(config.codingCmd), shared: config.share, reach: reach || null, capabilitiesHash, memoryHash, skillsHash };
+}
+
+let ampCapabilityCache = null;
+async function cachedAmpRuntimeCapability(config) {
+  const key = `${config.ampCmd}\n${path.resolve(config.cwd)}`;
+  if (ampCapabilityCache?.key === key && Date.now() - ampCapabilityCache.at < 60_000) {
+    return ampCapabilityCache.value ?? ampCapabilityCache.pending;
+  }
+  const pending = probeAmpRuntime({ cwd: config.cwd, executable: config.ampCmd });
+  ampCapabilityCache = { key, at: Date.now(), pending };
+  try {
+    const value = await pending;
+    ampCapabilityCache = { key, at: Date.now(), value };
+    return value;
+  } catch (error) {
+    if (ampCapabilityCache?.pending === pending) ampCapabilityCache = null;
+    throw error;
+  }
 }
 
 // Push a snapshot of this agent's runtime capabilities (skills, CLIs, MCP servers,
@@ -1622,6 +1791,7 @@ async function pushCapabilitiesSnapshot(ws, config, reach = null) {
       clis: caps.clis,
       mcpServers: caps.mcpServers,
       sharedModels: caps.sharedModels,
+      runtimes: caps.runtimes,
       codingRoute: caps.codingRoute,
       shared: caps.shared,
       memoryRoot: caps.memoryRoot,
@@ -1845,6 +2015,7 @@ export const __test = {
   probeExistingCursorBuddyBridge,
   parseCursorBuddyControlIntent,
   runAgentJob,
+  runAmpAgentJob,
   normalizeConfig,
   heartbeatMetadata,
   abortInferenceRequests,
@@ -1852,5 +2023,6 @@ export const __test = {
   createExecutor,
   buildAgentCommand,
   buildPrompt,
+  computeCapabilities,
   LEAN_PROMPT_MAX_BYTES,
 };

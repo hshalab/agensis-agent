@@ -8,6 +8,11 @@ selected coding CLI in the configured working directory, and streams results
 back to Agensis. The website, backend, and desktop application remain in a
 separate private repository; this repository contains only the host-side agent.
 
+Amp Orb agents use the same connection: the daemon invokes the signed-in local
+Amp CLI to create or continue an Amp-managed orb thread, then streams that
+thread back into its Agensis conversation. Amp authentication and billing stay
+on the host. See the CLI package README for setup and failure behavior.
+
 ## Install
 
 ```sh

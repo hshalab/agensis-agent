@@ -15,6 +15,7 @@ const PROFILE_KEYS = [
   "name",
   "cwd",
   "codingCmd",
+  "ampCmd",
   "model",
   "permissionMode",
   "timeoutMs",

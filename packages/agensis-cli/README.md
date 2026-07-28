@@ -62,6 +62,7 @@ Optional:
 - `--name <name>`: display name
 - `--cwd <path>`: folder where the coding CLI runs
 - `--coding-cmd <command>`: command used for jobs, default `claude -p`
+- `--amp-cmd <path>`: Amp CLI executable used by Amp Orb agents, default `amp`
 - `--no-coding`: disable coding jobs while keeping presence or shared inference online
 - `--full-cli-context`: opt out of the default lean launch and load all user-level
   Claude/Codex skills, plugins, hooks, memory, and MCP servers
@@ -88,6 +89,7 @@ Environment fallbacks:
 - `AGENSIS_NAME`
 - `AGENSIS_CWD`
 - `AGENSIS_CODING_CMD` or `CODING_CMD`
+- `AGENSIS_AMP_CMD`
 - `AGENSIS_NO_CODING=1`
 - `AGENSIS_MODEL` or `CLAUDE_MODEL`
 - `AGENSIS_PERMISSION_MODE`
@@ -96,6 +98,34 @@ Environment fallbacks:
 - `AGENSIS_SHARE=1`
 - `AGENSIS_SHARED_MODELS_FILE`
 - `AGENSIS_ONCE=1`
+
+## Run Amp Orb Agents
+
+Create an **Amp Orb** agent from the Agensis template gallery, then connect that
+agent from the repository it should work on using the normal copied `agensis
+connect` command. The daemon uses the Amp CLI on this machine to start a fresh
+orb for the first message in an Agensis conversation and continues the exact Amp
+thread for later messages in that conversation.
+
+Before connecting:
+
+```sh
+amp version
+amp usage
+amp projects status --json
+```
+
+The repository must be an Amp project that the signed-in account can access. If
+the repository has an `.agents/setup` script, make it executable so Amp can run
+it while preparing a fresh orb. A nonstandard Amp installation can be selected
+with `--amp-cmd /path/to/amp` or `AGENSIS_AMP_CMD`.
+
+Amp account credentials and billing stay on this daemon host. Agensis receives
+the streamed conversation output and the Amp thread ID/link, never the account
+token. Missing CLI, unsupported versions, signed-out or expired accounts,
+project access, setup, credit, provisioning, cancellation, timeout, and missing
+thread failures are returned to the Agensis conversation as explicit errors;
+an Amp agent never falls back to another coding CLI.
 
 ## Share Local Inference
 
