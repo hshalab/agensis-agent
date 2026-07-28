@@ -10,9 +10,12 @@ const FAILURE_MESSAGES = {
   amp_version_unsupported: 'The installed Amp CLI does not support orb execute streaming. Update Amp, then reconnect this agent.',
   amp_not_authenticated: 'Amp is not signed in on the connected machine. Run `amp login` there, then try again.',
   amp_auth_expired: 'The Amp sign-in on the connected machine has expired. Run `amp login` there, then try again.',
-  amp_project_not_found: 'This repository is not an Amp project. Create or join its Amp project, then try again.',
-  amp_project_unmatched: 'This repository is not linked to an Amp project. Create or join its Amp project, then try again.',
+  // Both project messages name the exact command, because "create or join its
+  // Amp project" left the operator guessing at the CLI that does it.
+  amp_project_not_found: 'This repository is not an Amp project. Run `amp projects create <repository-url> --workspace` in it (or `--personal`), then try again.',
+  amp_project_unmatched: 'This repository is not linked to an Amp project. Run `amp projects create <repository-url> --workspace` in it (or `--personal`), then try again.',
   amp_project_forbidden: 'The connected Amp account cannot access this repository project.',
+  amp_repo_access_denied: 'Amp cannot reach this GitHub repository. Grant the Amp GitHub connection access to it at https://ampcode.com/settings, then try again.',
   amp_repo_not_allowed: 'This repository is not allowed by the connected Agensis daemon profile.',
   amp_insufficient_credit: 'The connected Amp account does not have enough credit to start or continue this orb.',
   amp_orb_provision_failed: 'Amp could not provision the orb for this turn.',
@@ -45,11 +48,19 @@ export function ampThreadUrl(threadId) {
   return id ? `https://ampcode.com/threads/${id}` : '';
 }
 
+// `-o` (run this turn in an orb) is a boolean short flag that Amp's parser only
+// accepts BUNDLED with another short flag. Passing it as its own argv element —
+// `['-o', '-x', prompt]` — is rejected outright with `unknown option '-o'`, which
+// failed every orb turn at argument parsing before the agent ever started. It has
+// to be `-ox`. Verified against amp 0.0.1785256223:
+//   amp -o -x "…"  -> Error: unknown option '-o'
+//   amp -o x       -> Error: unknown option '-o'   (so it takes no value)
+//   amp -ox "…"    -> orb engaged (reaches real provisioning)
 export function buildAmpCommand({ prompt, threadId = '', executable = 'amp' } = {}) {
   const id = validAmpThreadId(threadId);
   return id
     ? { cmd: executable, args: ['threads', 'continue', id, '-x', String(prompt || ''), '--stream-json'] }
-    : { cmd: executable, args: ['-o', '-x', String(prompt || ''), '--stream-json', '--no-archive-after-execute'] };
+    : { cmd: executable, args: ['-ox', String(prompt || ''), '--stream-json', '--no-archive-after-execute'] };
 }
 
 export function createAmpStreamTracker() {
@@ -92,6 +103,13 @@ export function classifyAmpFailure(result = {}) {
   const text = `${result?.error?.message || ''}\n${result?.stderr || ''}\n${result?.stdout || ''}`.trim();
   let code = 'amp_cli_crashed';
   if (result?.error?.code === 'ENOENT' || /spawn\s+amp\s+ENOENT|command not found/i.test(text)) code = 'amp_not_installed';
+  // An Amp release that drops or renames a flag we pass is a VERSION problem, not
+  // a crash. Reporting it as "the CLI stopped unexpectedly" is what made the `-o`
+  // regression above look like a mystery instead of an obvious argv mismatch.
+  else if (/unknown option|unknown command|unrecognized option/i.test(text)) code = 'amp_version_unsupported';
+  // Amp reached GitHub and was refused. Distinct from amp_project_*: the project
+  // can exist and match while Amp's GitHub connection still cannot read the repo.
+  else if (/could not access this github repository|github connection has access/i.test(text)) code = 'amp_repo_access_denied';
   else if (result?.aborted === true || /^cancelled$/i.test(String(result?.error?.message || '').trim())) code = 'amp_turn_cancelled';
   else if (/timed out|timeout/i.test(text)) code = 'amp_turn_timed_out';
   else if (/(?:auth(?:entication)?|session|token|credential)[^\n]*(?:expired|invalid|revoked)/i.test(text)) code = 'amp_auth_expired';
@@ -138,7 +156,9 @@ function safeProject(project) {
   return {
     id: String(project.id || '').slice(0, 160),
     name: String(project.name || project.slug || '').slice(0, 200),
-    repository: String(project.repository || project.repo || project.repositoryUrl || '').slice(0, 500),
+    // Amp emits `repositoryURL` (capital URL). Without that spelling the probe
+    // reported a matched project with an empty repository.
+    repository: String(project.repositoryURL || project.repository || project.repo || project.repositoryUrl || '').slice(0, 500),
   };
 }
 

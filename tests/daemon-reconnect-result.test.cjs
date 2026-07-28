@@ -25,7 +25,13 @@ const REPO_ROOT = path.resolve(__dirname, '..');
 
 // Drives one daemon against a fake hub that kills the socket mid-job.
 // `workMs` decides whether the turn lands after the reconnect or inside the gap.
-async function runDropMidJob({ workMs, terminateAfterMs = 800, waitMs = 12_000 }) {
+//
+// The socket is killed when the daemon FIRST reports progress on the job, not on
+// a timer measured from register. A fixed timer made this flaky: under a loaded
+// machine the daemon takes longer to boot and the terminate landed before the
+// turn had started, so there was no in-flight work to lose and the assertion
+// failed for a reason that had nothing to do with the behaviour under test.
+async function runDropMidJob({ workMs, waitMs = 20_000 }) {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agensis-reconnect-'));
   const fakeCli = path.join(tempDir, 'fake-cli.mjs');
   await fs.writeFile(
@@ -41,7 +47,7 @@ async function runDropMidJob({ workMs, terminateAfterMs = 800, waitMs = 12_000 }
   });
   const port = server.address().port;
 
-  const state = { connections: 0, resultOnSecondSocket: null, resultOnFirstSocket: null };
+  const state = { connections: 0, resultOnSecondSocket: null, resultOnFirstSocket: null, terminated: false };
   let child;
 
   try {
@@ -69,8 +75,14 @@ async function runDropMidJob({ workMs, terminateAfterMs = 800, waitMs = 12_000 }
               agent: { model: 'claude-opus-4-8', permission_mode: 'default', run_mode: 'daemon' },
             },
           }));
-          // Stand in for the hub's liveness reaper: terminate(), mid-job.
-          setTimeout(() => socket.terminate(), terminateAfterMs);
+        }
+
+        // Stand in for the hub's liveness reaper: terminate() the moment the turn
+        // is demonstrably in flight, so the drop always lands mid-job.
+        if (index === 1 && !state.terminated && frame.jobId === 'job-drop'
+          && frame.action !== 'agent_job_result') {
+          state.terminated = true;
+          socket.terminate();
         }
 
         if (frame.action === 'agent_job_result') {
@@ -101,7 +113,12 @@ async function runDropMidJob({ workMs, terminateAfterMs = 800, waitMs = 12_000 }
     child.stdout.on('data', (d) => { output += String(d); });
     child.stderr.on('data', (d) => { output += String(d); });
 
-    await new Promise((resolve) => setTimeout(resolve, waitMs));
+    // Poll for the outcome instead of sleeping a fixed span: fast when the daemon
+    // is quick, still correct when the machine is busy.
+    const deadline = Date.now() + waitMs;
+    while (Date.now() < deadline && !state.resultOnSecondSocket) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
     state.output = output;
     return state;
   } finally {

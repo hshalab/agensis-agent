@@ -12,11 +12,40 @@ test('Amp jobs are selected explicitly from agent metadata', () => {
   assert.equal(amp.isAmpJob({ agent: { run_mode: 'daemon' } }), false);
 });
 
+// `-o` MUST stay bundled as `-ox`. Amp's parser rejects it as its own argv
+// element (`unknown option '-o'`), which failed every orb turn at parse time.
 test('a new Amp lane starts an execute-mode thread in a fresh orb', () => {
   assert.deepEqual(
     amp.buildAmpCommand({ prompt: 'fix the tests' }),
-    { cmd: 'amp', args: ['-o', '-x', 'fix the tests', '--stream-json', '--no-archive-after-execute'] },
+    { cmd: 'amp', args: ['-ox', 'fix the tests', '--stream-json', '--no-archive-after-execute'] },
   );
+});
+
+test('the orb flag is never passed as a standalone argv element', () => {
+  const { args } = amp.buildAmpCommand({ prompt: 'anything' });
+  assert.equal(args.includes('-o'), false, "amp rejects a bare '-o' with unknown option");
+  assert.equal(args[0], '-ox');
+});
+
+test('a dropped or renamed Amp flag reads as a version problem, not a crash', () => {
+  assert.equal(
+    amp.classifyAmpFailure({ status: 1, stderr: "Error: error: unknown option '-o'" }).code,
+    'amp_version_unsupported',
+  );
+});
+
+test('a GitHub repo Amp cannot read is its own actionable failure', () => {
+  const failure = amp.classifyAmpFailure({
+    status: 1,
+    stderr: 'Error: Amp could not access this GitHub repository. Check that the URL is correct and that your GitHub connection has access to it, then try again.',
+  });
+  assert.equal(failure.code, 'amp_repo_access_denied');
+  assert.match(failure.message, /GitHub connection/i);
+});
+
+test('a missing Amp project names the command that creates one', () => {
+  assert.match(amp.ampFailureMessage('amp_project_not_found'), /amp projects create .* --workspace/);
+  assert.match(amp.ampFailureMessage('amp_project_unmatched'), /amp projects create .* --workspace/);
 });
 
 test('an existing Amp lane continues the exact thread without requesting a new orb', () => {
@@ -245,7 +274,7 @@ test('daemon streams new and continued Amp turns and never launches its configur
     assert.equal(timedOut.find(frame => frame.action === 'agent_job_result').metadata.ampErrorCode, 'amp_turn_timed_out');
 
     const calls = (await fs.readFile(callsFile, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
-    assert.ok(calls.some(args => args[0] === '-o' && args[1] === '-x' && args.includes('--stream-json') && args.includes('--no-archive-after-execute')));
+    assert.ok(calls.some(args => args[0] === '-ox' && args.includes('--stream-json') && args.includes('--no-archive-after-execute')));
     assert.ok(calls.some(args => args[0] === 'threads' && args[1] === 'continue' && args[2] === threadId));
     const missingCall = calls.find(args => args.includes('prompt missing'));
     assert.deepEqual(missingCall.slice(0, 3), ['threads', 'continue', threadId], 'a missing continuation never falls back to a fresh orb');
