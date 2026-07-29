@@ -278,6 +278,46 @@ export function createPermissionBroker({
         : denial(String(message.message || "").trim() || `${decidedBy || "The workspace"} denied this tool call.`));
     },
 
+    /**
+     * The request ids this process is still parked on.
+     *
+     * Sent on every register. A socket drop does NOT end the turn — the CLI
+     * subprocess is still sitting inside canUseTool waiting on these promises —
+     * but the server cannot tell a blip from a restart, because the register
+     * frame carries no process identity. Naming the ids is that proof: only a
+     * process that still holds the promise can name the id it is holding, so the
+     * server re-homes exactly these and gives up on the rest.
+     */
+    parkedRequestIds() {
+      return [...pending.keys()];
+    },
+
+    /**
+     * Settle up after a reconnect, given the ids the server says it re-homed.
+     *
+     * Anything NOT in that list is a request the server has already expired (or
+     * never had): its card is gone from the human's screen and no decision can
+     * ever arrive for it. Denying now is what keeps the turn moving — parking on
+     * regardless would hold it open until the 10-minute TTL waiting for an answer
+     * nobody can give.
+     *
+     * `resumed` absent means an older server that does not re-home at all, so it
+     * denies everything — exactly the behaviour before this existed. Fail-closed:
+     * the cost of a wrong guess here is one extra prompt, never a tool call that
+     * runs without an answer.
+     */
+    resume(resumed) {
+      const kept = new Set((Array.isArray(resumed) ? resumed : []).map((id) => String(id || "")));
+      let denied = 0;
+      for (const requestId of [...pending.keys()]) {
+        if (kept.has(requestId)) continue;
+        if (settle(requestId, denial("The connection to Agensis dropped and this request could no longer be answered. Ask again in the chat."))) denied += 1;
+      }
+      if (kept.size > 0) log(`kept ${kept.size} permission request(s) parked across the reconnect`);
+      if (denied > 0) log(`denied ${denied} permission request(s) the reconnect could not recover`);
+      return { kept: kept.size, denied };
+    },
+
     /** Deny everything parked for a job that is going away. */
     cancelJob(jobId, reason = "The job ended before this was approved.") {
       const id = String(jobId || "");
@@ -289,7 +329,15 @@ export function createPermissionBroker({
       return cancelled;
     },
 
-    /** Deny everything parked — the daemon is shutting down or lost its socket. */
+    /**
+     * Deny everything parked — the daemon is shutting DOWN.
+     *
+     * Deliberately not called on socket close any more. A dropped socket is not
+     * the end of the turn: the CLI subprocess keeps running and reconnects ~2s
+     * later, and denying here meant a tool call raised 90 seconds ago with eight
+     * minutes of TTL left was refused because the network hiccuped. `resume()`
+     * is what a reconnect goes through instead.
+     */
     shutdown(reason = "The agent daemon disconnected before this was approved.") {
       let cancelled = 0;
       for (const requestId of [...pending.keys()]) {

@@ -236,6 +236,71 @@ test('cancelling a job denies every request parked for it and leaves other jobs 
   assert.equal((await other).behavior, 'deny');
 });
 
+// --- surviving a reconnect ---------------------------------------------------
+//
+// A dropped socket used to deny every parked request on the spot, on the theory
+// that "the reconnect gets a fresh socket the server has no request ids for".
+// That was true only because nobody told it: the turn is still executing inside
+// the CLI subprocess, and 2026-07-29 an Edit approval raised 90 seconds earlier,
+// with eight minutes of its ten-minute TTL left, died because the socket blipped.
+//
+// So the park now survives, and the register frame re-asserts the ids — which is
+// also the ONLY way the server can tell a blip from a restart, since the frame
+// carries no process identity. resume() then reconciles: the server names what
+// it kept, and everything else is denied here rather than left hanging.
+
+test('the ids a reconnect re-asserts are exactly the ones still parked', async () => {
+  const { createPermissionBroker } = await loadPermissions();
+  const broker = createPermissionBroker({ send: () => true, idFactory: (() => { let n = 0; return () => `req-${n += 1}`; })() });
+
+  const first = broker.request({ jobId: 'job-1', toolName: 'Bash' });
+  broker.request({ jobId: 'job-2', toolName: 'Edit' });
+  assert.deepEqual(broker.parkedRequestIds(), ['req-1', 'req-2']);
+
+  broker.decide({ requestId: 'req-1', behavior: 'allow', scope: 'once' });
+  await first;
+  assert.deepEqual(broker.parkedRequestIds(), ['req-2'], 'a settled request is not re-asserted');
+});
+
+test('a request the server re-homed keeps waiting for its human', async () => {
+  const { createPermissionBroker } = await loadPermissions();
+  const broker = createPermissionBroker({ send: () => true, idFactory: () => 'req-1' });
+  const parked = broker.request({ jobId: 'job-1', toolName: 'Edit' });
+
+  // The socket dropped and came back; the server confirms this park survived.
+  assert.deepEqual(broker.resume(['req-1']), { kept: 1, denied: 0 });
+  assert.equal(broker.pendingCount(), 1, 'still parked — the human has minutes of TTL left to answer');
+
+  // And the decision that eventually arrives still settles it.
+  assert.equal(broker.decide({ requestId: 'req-1', behavior: 'allow', scope: 'once' }), true);
+  assert.equal((await parked).behavior, 'allow');
+});
+
+test('a request the server did not re-home is denied at once, not left hanging', async () => {
+  const { createPermissionBroker } = await loadPermissions();
+  const broker = createPermissionBroker({ send: () => true, idFactory: () => 'req-1' });
+  const parked = broker.request({ jobId: 'job-1', toolName: 'Edit' });
+
+  // The server expired it — its card is gone, so no decision can ever arrive.
+  // Parking on regardless would hold the turn to the full 10-minute TTL.
+  assert.deepEqual(broker.resume(['some-other-id']), { kept: 1, denied: 1 });
+  assert.equal((await parked).behavior, 'deny');
+  assert.equal(broker.pendingCount(), 0);
+});
+
+test('an older server that says nothing about parks denies them, rather than hanging the turn', async () => {
+  const { createPermissionBroker } = await loadPermissions();
+  const broker = createPermissionBroker({ send: () => true, idFactory: () => 'req-1' });
+  const parked = broker.request({ jobId: 'job-1', toolName: 'Edit' });
+
+  // No `resumedPermissionRequests` field at all. Absent must read as "none kept"
+  // — the fail-closed direction, and exactly the pre-existing deny-on-drop
+  // behaviour. Reading it as "keep everything" would hang against every server
+  // that has not shipped the re-home yet.
+  assert.deepEqual(broker.resume(undefined), { kept: 0, denied: 1 });
+  assert.equal((await parked).behavior, 'deny');
+});
+
 test('a decision for an unknown request id is ignored rather than crashing the socket handler', async () => {
   const { createPermissionBroker } = await loadPermissions();
   const broker = createPermissionBroker({ send: () => true });
