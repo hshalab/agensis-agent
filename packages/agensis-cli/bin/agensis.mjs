@@ -77,6 +77,10 @@ function parseArgs(argv) {
       args.cursorBuddyBridge = false;
       continue;
     }
+    if (key === "noAutoUpdate") {
+      args.autoUpdate = false;
+      continue;
+    }
     if (key === "yolo" || key === "noSandbox") {
       args.permissionMode = "yolo";
       continue;
@@ -155,7 +159,7 @@ Options:
   --version               Print the CLI version
   --help                  Show this help
 
-agensis supervise [--profile <name>] [--poll-ms <ms>]
+agensis supervise [--profile <name>] [--poll-ms <ms>] [--no-auto-update] [--auto-check-ms <ms>]
   Runs the daemon as a supervised child instead of in this process, so an agent
   can request a self-update (writing update-request.json into its own state
   dir) with automatic install + health-check + rollback to the last-known-good
@@ -219,7 +223,16 @@ async function main() {
     if (!cached) throw new Error(daemonProfileSetupMessage(profile));
     const { runSupervisor } = await import("../src/supervise.mjs");
     const pollIntervalMs = args.pollMs ? Number(args.pollMs) : undefined;
-    await runSupervisor({ config: cached, runningVersion: AGENSIS_CLI_VERSION, profileName: profile, pollIntervalMs });
+    // Automatic updates are ON for `agensis supervise` — supervising is the act of
+    // asking for a managed daemon, and a managed daemon that silently rots on an
+    // old version is the thing this command exists to prevent. `--no-auto-update`
+    // for an operator who pins versions deliberately.
+    const autoUpdate = args.autoUpdate !== false;
+    const autoCheckIntervalMs = args.autoCheckMs ? Number(args.autoCheckMs) : undefined;
+    await runSupervisor({
+      config: cached, runningVersion: AGENSIS_CLI_VERSION, profileName: profile,
+      pollIntervalMs, autoUpdate, autoCheckIntervalMs,
+    });
     return;
   }
   if (args.command === "setup") {
