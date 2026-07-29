@@ -77,6 +77,33 @@ export async function runAgensisDaemon(rawConfig = {}) {
     log,
   });
 
+  // How long parked approvals wait for a reconnect before giving up on it.
+  //
+  // Matched to the hub's own reconnect grace (JOB_RECONNECT_GRACE_MS, 45s): past
+  // that point the server has expired the request and failed the job anyway, so
+  // holding the turn open for the remaining minutes of the request's TTL just
+  // makes the agent look hung. We reconnect every 2s, so this only ever fires
+  // when the daemon is genuinely cut off.
+  const PERMISSION_RECONNECT_GRACE_MS = 45_000;
+  let permissionReconnectTimer = null;
+
+  const cancelPermissionReconnectDeadline = () => {
+    if (!permissionReconnectTimer) return;
+    clearTimeout(permissionReconnectTimer);
+    permissionReconnectTimer = null;
+  };
+
+  // Armed on socket close, cancelled by a successful register. Without it, the
+  // parks that now survive a drop would survive a permanent outage too.
+  const armPermissionReconnectDeadline = () => {
+    if (permissionReconnectTimer || permissions.pendingCount() === 0) return;
+    permissionReconnectTimer = setTimeout(() => {
+      permissionReconnectTimer = null;
+      permissions.shutdown("The connection to Agensis stayed down, so this could not be approved. Ask again in the chat.");
+    }, PERMISSION_RECONNECT_GRACE_MS);
+    permissionReconnectTimer.unref?.();
+  };
+
   // Results that had nowhere to go because the socket was gone when the turn
   // finished. A dropped socket does NOT stop the work: the CLI subprocess runs to
   // completion, and before this its answer went straight into send()'s
@@ -244,6 +271,7 @@ export async function runAgensisDaemon(rawConfig = {}) {
   const stop = () => {
     stopped = true;
     abortInferenceRequests(activeInference);
+    cancelPermissionReconnectDeadline();
     permissions.shutdown("The agent daemon shut down before this was approved.");
     if (reconnectTimer) clearTimeout(reconnectTimer);
     if (heartbeatTimer) clearInterval(heartbeatTimer);
@@ -335,6 +363,11 @@ export async function runAgensisDaemon(rawConfig = {}) {
         name: config.name,
         host: os.hostname(),
         cwd: config.cwd,
+        // Tool calls this process is STILL parked on, so a reconnect after a blip
+        // keeps them alive instead of losing them. Only this process can name
+        // these ids, which is what lets the server tell a reconnecting daemon
+        // apart from a restarted one — see permissions.parkedRequestIds().
+        permissionRequestIds: permissions.parkedRequestIds(),
         ...(identity ? { identity } : {}),
         metadata: {
           codingCmd: config.codingCmd,
@@ -389,6 +422,13 @@ export async function runAgensisDaemon(rawConfig = {}) {
         // Before anything else on a reconnect: hand back any turn that finished
         // while we had no socket, so the hub can settle it instead of reaping it.
         flushParkedResults();
+        // Then settle the tool calls that are still waiting on a human. The server
+        // names the ones it re-homed onto this connection; every other parked
+        // request is denied on the spot, because its card is gone and no decision
+        // can reach us. An older server sends no such field, which reads as "none"
+        // and reproduces the pre-existing deny-on-drop behaviour.
+        cancelPermissionReconnectDeadline();
+        permissions.resume(message.resumedPermissionRequests);
         log(`Registered as ${message.connection?.name || config.name} on ${message.connection?.host || os.hostname()}`);
         if (config.onRegistered) {
           void Promise.resolve(config.onRegistered(config, message)).catch((error) => {
@@ -566,9 +606,14 @@ export async function runAgensisDaemon(rawConfig = {}) {
 
     ws.on("close", (code, reason) => {
       abortInferenceRequests(activeInference);
-      // Whoever was going to answer these can no longer reach us, and the
-      // reconnect gets a fresh socket the server has no request ids for.
-      permissions.shutdown();
+      // Parked permission requests deliberately SURVIVE this, the same way
+      // parkedResults does. The turn holding them is still executing inside the
+      // CLI subprocess; denying on close refused tool calls that had minutes of
+      // TTL left because the socket blipped for two seconds. The register frame
+      // below re-asserts their ids and `agent_registered` tells us which ones the
+      // server kept — anything it did not keep is denied there, not here. The
+      // deadline is the backstop for a reconnect that never lands.
+      armPermissionReconnectDeadline();
       socketRegistered = false;
       registeredConnection = null;
       const closeReason = String(reason || "");
