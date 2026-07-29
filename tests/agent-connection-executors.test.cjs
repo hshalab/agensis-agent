@@ -481,3 +481,117 @@ test('summarizeToolInput: one short line from the first useful key, never the wh
   assert.equal(summarizeToolInput(undefined), '');
   assert.equal(summarizeToolInput({ command: 'x'.repeat(500) }).length, 121); // 120 chars + ellipsis
 });
+
+// A reasoning model on a long tool sweep narrates in `thinking` blocks, not
+// `text` blocks. The assistant handler filtered on `type === "text"`, so all of
+// it hit the floor: Jason watched a 14-tool run produce 14 chips and not one
+// word of explanation, and asked "you're telling me there's NOTHING BEING SAID
+// IN BETWEEN?". There was — the daemon threw it away. Tool RESULTS were dropped
+// the same way: the pump had no `user` branch, and `user` is the SDK message
+// type that carries tool_result back, so every chip said what was called and
+// never whether it worked.
+test('claude sdk executor: surfaces thinking and tool results, interleaved in model order', async () => {
+  const { createClaudeSdkExecutor } = await load();
+  const queryFn = ({ prompt }) => {
+    const gen = (async function* () {
+      for await (const _input of prompt) {
+        yield {
+          type: 'assistant',
+          session_id: 's1',
+          message: {
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'I need to find where\n  permissions are checked.' },
+              { type: 'tool_use', id: 'tu_1', name: 'Grep', input: { pattern: 'canUseTool' } },
+            ],
+          },
+        };
+        yield {
+          type: 'user',
+          session_id: 's1',
+          message: {
+            role: 'user',
+            content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: [{ type: 'text', text: '3 matches' }] }],
+          },
+        };
+        yield {
+          type: 'assistant',
+          session_id: 's1',
+          message: {
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'Found it. Now read the file.' },
+              { type: 'tool_use', id: 'tu_2', name: 'Read', input: { file_path: 'a.mjs' } },
+            ],
+          },
+        };
+        yield {
+          type: 'user',
+          session_id: 's1',
+          message: {
+            role: 'user',
+            content: [{ type: 'tool_result', tool_use_id: 'tu_2', is_error: true, content: 'ENOENT' }],
+          },
+        };
+        yield { type: 'result', subtype: 'success', result: 'done', session_id: 's1' };
+      }
+    })();
+    gen.interrupt = async () => {};
+    return gen;
+  };
+  const ex = createClaudeSdkExecutor({ queryFn });
+
+  const lines = [];
+  await ex.run({ cwd: '/tmp', prompt: 'go', sessionKey: 'silo-thinking', onData: (c) => lines.push(c) });
+  const steps = lines.map((l) => JSON.parse(l.trim()))
+    .filter((m) => m.type === 'agensis_step')
+    .map((m) => `${m.step.kind}:${m.step.name}:${m.step.detail}`);
+
+  // Think, call, result, think, call, result — narration keeps its place next to
+  // the call it introduces, rather than being batched ahead of every tool.
+  assert.deepEqual(steps, [
+    'thinking:Thinking:I need to find where permissions are checked.',
+    'tool:Grep:canUseTool',
+    'tool_result:Grep:3 matches',
+    'thinking:Thinking:Found it. Now read the file.',
+    'tool:Read:a.mjs',
+    'tool_result:Read:Failed: ENOENT',
+  ]);
+});
+
+test('claude sdk executor: a thinking block with nothing in it raises no chip', async () => {
+  const { createClaudeSdkExecutor } = await load();
+  const queryFn = ({ prompt }) => {
+    const gen = (async function* () {
+      for await (const _input of prompt) {
+        yield {
+          type: 'assistant',
+          session_id: 's1',
+          message: { role: 'assistant', content: [{ type: 'thinking', thinking: '   \n  ' }] },
+        };
+        yield { type: 'result', subtype: 'success', result: 'done', session_id: 's1' };
+      }
+    })();
+    gen.interrupt = async () => {};
+    return gen;
+  };
+  const ex = createClaudeSdkExecutor({ queryFn });
+  const lines = [];
+  await ex.run({ cwd: '/tmp', prompt: 'go', sessionKey: 'silo-empty-think', onData: (c) => lines.push(c) });
+  assert.equal(lines.map((l) => JSON.parse(l.trim())).filter((m) => m.type === 'agensis_step').length, 0);
+});
+
+test('summarizeThinking / summarizeToolResult collapse and cap their prose', async () => {
+  const { summarizeThinking, summarizeToolResult } = await load();
+  assert.equal(summarizeThinking('a\n\n  b\tc '), 'a b c');
+  assert.equal(summarizeThinking(''), '');
+  assert.equal(summarizeThinking(undefined), '');
+  assert.equal(summarizeThinking('x'.repeat(300)).length, 241, 'capped at 240 + ellipsis');
+  assert.ok(summarizeThinking('x'.repeat(300)).endsWith('…'));
+  // A plain string body is as valid as a block array.
+  assert.equal(summarizeToolResult({ content: 'two  lines\nhere' }), 'two lines here');
+  assert.equal(summarizeToolResult({ content: 'boom', is_error: true }), 'Failed: boom');
+  assert.equal(summarizeToolResult({ content: '', is_error: true }), 'Failed');
+  assert.equal(summarizeToolResult({ content: '' }), '');
+  assert.equal(summarizeToolResult(null), '');
+});

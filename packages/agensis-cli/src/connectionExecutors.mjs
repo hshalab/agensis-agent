@@ -151,6 +151,47 @@ function encodeAgensisSegment(segment) {
 
 const TOOL_DETAIL_KEYS = ["file_path", "path", "pattern", "command", "description", "prompt"];
 const TOOL_DETAIL_MAX = 120;
+// Narration and results get more room than a tool's argument line: they are the
+// only prose in the strip, and 120 chars cuts most sentences in half.
+const PROSE_DETAIL_MAX = 240;
+
+function condense(value, max) {
+  const line = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!line) return "";
+  return line.length > max ? `${line.slice(0, max)}…` : line;
+}
+
+/**
+ * The model's reasoning between tool calls.
+ *
+ * A reasoning model on a long tool sweep narrates in `thinking` blocks, not
+ * `text` blocks — so the assistant handler's `type === "text"` filter dropped
+ * ALL of it and the thread showed a wall of tool chips with nothing said in
+ * between. The daemon had no concept of a thinking block at all.
+ */
+export function summarizeThinking(text) {
+  return condense(text, PROSE_DETAIL_MAX);
+}
+
+/**
+ * What a tool actually returned.
+ *
+ * The pump had no `user` branch, and `user` is exactly the SDK message type
+ * carrying `tool_result` back — so every chip said what was called and never
+ * whether it worked. Half of each round trip was invisible by construction.
+ */
+export function summarizeToolResult(block) {
+  const raw = block?.content;
+  const text = typeof raw === "string"
+    ? raw
+    : Array.isArray(raw)
+      ? raw.filter((part) => part && part.type === "text" && typeof part.text === "string")
+          .map((part) => part.text).join(" ")
+      : "";
+  const line = condense(text, PROSE_DETAIL_MAX);
+  if (block?.is_error) return line ? `Failed: ${line}` : "Failed";
+  return line;
+}
 
 /** Short single-line summary of a tool_use input — never the whole input object. */
 export function summarizeToolInput(input) {
@@ -374,12 +415,41 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
                 turn.flushed += turn.streamed;
                 turn.streamed = "";
               }
+              // ONE ordered pass, so narration keeps its place relative to the
+              // calls it introduces: think, call, think, call — the order the
+              // model actually produced. Two separate loops would batch all the
+              // thinking ahead of all the tools and lose that.
               for (const block of content) {
-                if (!block || block.type !== "tool_use" || !block.name) continue;
+                if (!block) continue;
+                if (block.type === "thinking") {
+                  const detail = summarizeThinking(block.thinking ?? block.text);
+                  if (detail) turn.onData?.(encodeAgensisStep({ kind: "thinking", name: "Thinking", detail }));
+                } else if (block.type === "tool_use" && block.name) {
+                  // Remember the name so the tool_result arriving later on a
+                  // `user` message can be labelled with the tool it belongs to
+                  // instead of a bare id.
+                  if (block.id) turn.toolNames.set(String(block.id), String(block.name));
+                  turn.onData?.(encodeAgensisStep({
+                    kind: "tool",
+                    name: String(block.name),
+                    detail: summarizeToolInput(block.input),
+                  }));
+                }
+              }
+            }
+          } else if (message.type === "user") {
+            // Tool results come back as a `user` message. Without this branch the
+            // strip showed every call and no outcome.
+            const content = message.message?.content;
+            if (Array.isArray(content)) {
+              for (const block of content) {
+                if (!block || block.type !== "tool_result") continue;
+                const detail = summarizeToolResult(block);
+                if (!detail) continue;
                 turn.onData?.(encodeAgensisStep({
-                  kind: "tool",
-                  name: String(block.name),
-                  detail: summarizeToolInput(block.input),
+                  kind: "tool_result",
+                  name: turn.toolNames.get(String(block.tool_use_id)) || "Result",
+                  detail,
                 }));
               }
             }
@@ -436,6 +506,10 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
         // TURN, not the session, because a pooled session serves many jobs and
         // the rules ride in on each job's payload.
         jobId: opts.job?.id || "",
+        // tool_use id -> tool name, so a tool_result can be labelled with what it
+        // came from. Per TURN, not per session: a pooled session runs many jobs
+        // and this would otherwise grow for the life of the process.
+        toolNames: new Map(),
         permissionRules: jobPermissionRules(opts.job),
         requestPermission: opts.requestPermission || null,
         finish(value) {
