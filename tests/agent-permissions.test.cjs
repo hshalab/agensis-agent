@@ -340,6 +340,52 @@ test('claude sdk executor: with no broker at all, canUseTool is left unset as be
   assert.equal(probe.options().canUseTool, undefined);
 });
 
+// 'bypassPermissions' auto-approves every tool call BEFORE the callback is
+// consulted, so a canUseTool passed alongside it can never run. The SDK spots
+// the contradiction and emits CLAUDE_SDK_CAN_USE_TOOL_SHADOWED on stderr for
+// every session the daemon opens — noise on a promise the broker cannot keep.
+// yolo IS "don't ask me", so the broker is dropped rather than attached inert.
+test('claude sdk executor: yolo drops canUseTool instead of attaching one the SDK will never call', async () => {
+  const { createClaudeSdkExecutor } = await loadExecutors();
+  const probe = permissionProbeQuery();
+  let asked = 0;
+  const ex = createClaudeSdkExecutor({
+    queryFn: probe.queryFn,
+    requestPermission: async () => { asked += 1; return { behavior: 'allow', scope: 'once' }; },
+  });
+
+  await ex.run({
+    cwd: '/tmp', prompt: 'x', sessionKey: 'silo-yolo', permissionMode: 'yolo',
+    job: { id: 'j' }, onData: () => {},
+  }).catch(() => {});
+
+  assert.equal(probe.options().permissionMode, 'bypassPermissions');
+  assert.equal(probe.options().canUseTool, undefined);
+  assert.equal(asked, 0, 'yolo must not route tool calls through the human broker');
+});
+
+// The other two modes DO consult the callback, so it must still be attached —
+// otherwise the fix above would silently kill interactive approvals everywhere.
+for (const mode of ['default', 'accept_edits']) {
+  test(`claude sdk executor: ${mode} still attaches canUseTool`, async () => {
+    const { createClaudeSdkExecutor } = await loadExecutors();
+    const probe = permissionProbeQuery();
+    const ex = createClaudeSdkExecutor({
+      queryFn: probe.queryFn,
+      requestPermission: async () => ({ behavior: 'allow', scope: 'once' }),
+    });
+
+    await ex.run({
+      cwd: '/tmp', prompt: 'x', sessionKey: `silo-${mode}`, permissionMode: mode,
+      job: { id: 'j' }, onData: () => {},
+    });
+
+    assert.notEqual(probe.options().permissionMode, 'bypassPermissions');
+    assert.equal(typeof probe.options().canUseTool, 'function');
+    assert.deepEqual(probe.verdict(), { behavior: 'allow' });
+  });
+}
+
 // --- Codex lane -------------------------------------------------------------
 
 function fakeCodexChild() {

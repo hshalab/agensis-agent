@@ -278,6 +278,13 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
     }
     const queue = new PushQueue();
     const permission = mapClaudePermission(opts.permissionMode);
+    // 'bypassPermissions' ('yolo') auto-approves every call BEFORE the callback
+    // is consulted, so a canUseTool handed over alongside it is dead code: the
+    // SDK never invokes it and warns CLAUDE_SDK_CAN_USE_TOOL_SHADOWED on every
+    // session it builds. yolo IS the human saying "don't ask me", so drop the
+    // broker instead of attaching one that only pretends to gate.
+    const canAsk = permission.permissionMode !== "bypassPermissions"
+      && !!(requestPermission || opts.requestPermission);
     // Allocated BEFORE the query so canUseTool can close over the same object the
     // run loop later writes `activeTurn` onto. Rebuilding the object afterwards
     // would hand the callback a stale copy whose activeTurn is forever null.
@@ -306,9 +313,7 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
         // Absent this the SDK throws "canUseTool callback is not provided." on the
         // first tool that needs approval, which surfaces as an opaque tool error
         // and leaves the model narrating an approval prompt that exists nowhere.
-        canUseTool: (requestPermission || opts.requestPermission)
-          ? makeCanUseTool(session, requestPermission)
-          : undefined,
+        canUseTool: canAsk ? makeCanUseTool(session, requestPermission) : undefined,
         additionalDirectories: opts.hostFolders && opts.hostFolders.length ? opts.hostFolders : undefined,
         mcpServers,
         strictMcpConfig: opts.leanCli ? true : undefined,
