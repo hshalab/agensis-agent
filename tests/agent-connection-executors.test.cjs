@@ -549,10 +549,14 @@ test('claude sdk executor: surfaces thinking and tool results, interleaved in mo
 
   // Think, call, result, think, call, result — narration keeps its place next to
   // the call it introduces, rather than being batched ahead of every tool.
+  // A SUCCESSFUL result raises no chip: the server persists only name/detail and
+  // hardcodes message_kind='tool_step', so a success chip is indistinguishable
+  // from the call and merely doubles the strip (0.1.41 shipped that and it read
+  // as "17 tool calls and not a word said"). A FAILURE still earns a row —
+  // that is the half a reader cannot infer from the call itself.
   assert.deepEqual(steps, [
     'thinking:Thinking:I need to find where permissions are checked.',
     'tool:Grep:canUseTool',
-    'tool_result:Grep:3 matches',
     'thinking:Thinking:Found it. Now read the file.',
     'tool:Read:a.mjs',
     'tool_result:Read:Failed: ENOENT',
@@ -594,4 +598,16 @@ test('summarizeThinking / summarizeToolResult collapse and cap their prose', asy
   assert.equal(summarizeToolResult({ content: '', is_error: true }), 'Failed');
   assert.equal(summarizeToolResult({ content: '' }), '');
   assert.equal(summarizeToolResult(null), '');
+});
+
+// Narration lives in `thinking` blocks, so the strip is empty unless the SDK is
+// asked for them. Adaptive is already the default on capable models; pinning it
+// means a future default of 'disabled' can't silently empty the strip again.
+test('claude sdk executor: asks the SDK for adaptive thinking', async () => {
+  const { createClaudeSdkExecutor } = await load();
+  let seen = null;
+  const { queryFn } = fakeClaudeQuery({});
+  const ex = createClaudeSdkExecutor({ queryFn: (args) => { seen = args.options; return queryFn(args); } });
+  await ex.run({ cwd: '/tmp', prompt: 'hi', sessionKey: 'silo-thinking-opt' });
+  assert.deepEqual(seen.thinking, { type: 'adaptive' });
 });

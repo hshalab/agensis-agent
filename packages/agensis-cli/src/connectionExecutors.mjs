@@ -361,6 +361,12 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
         settingSources: opts.leanCli ? [] : undefined,
         persistSession: opts.leanCli ? false : undefined,
         includePartialMessages: true,
+        // Adaptive is already the default on models that support it, so this is
+        // making the intent explicit rather than switching something on: the
+        // narration the step strip surfaces lives in `thinking` blocks, and a
+        // future model default of 'disabled' would silently empty the strip
+        // again with nothing in this file to explain why.
+        thinking: { type: "adaptive" },
         env: scrubbedChildEnv(opts.mcp?.env),
       },
     });
@@ -444,6 +450,17 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
             if (Array.isArray(content)) {
               for (const block of content) {
                 if (!block || block.type !== "tool_result") continue;
+                // ONLY failures get a chip.
+                //
+                // 0.1.41 chipped every result, which doubled the strip: the server
+                // hardcodes message_kind='tool_step' and persists only name/detail,
+                // dropping step.kind — so a result is indistinguishable from a call
+                // in the DB and in the UI. Nine successful calls rendered as
+                // eighteen identical chips and read as "17 tool calls and not a word
+                // said". Restoring per-result chips needs a kind the server actually
+                // stores; until then a success is silent and only a FAILURE — the
+                // half a reader cannot infer from the call itself — earns a row.
+                if (!block.is_error) continue;
                 const detail = summarizeToolResult(block);
                 if (!detail) continue;
                 turn.onData?.(encodeAgensisStep({
