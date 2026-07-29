@@ -74,9 +74,13 @@ export function createSandboxExecutor(provider) {
         const stdout = patch
           ? `${exec.stdout || ""}\n\n\`\`\`diff\n${patch}\n\`\`\``
           : exec.stdout || "";
-        return { status: exec.status, stdout, stderr: exec.stderr || "", error: exec.error || null };
+        // `stop` rides through unchanged. This object is REBUILT rather than
+        // spread, so any new field the inner executor reports has to be named
+        // here or it is silently dropped — which is exactly how the SDK's
+        // stop_reason/usage/cost went missing for so long.
+        return { status: exec.status, stdout, stderr: exec.stderr || "", error: exec.error || null, stop: exec.stop || null };
       } catch (error) {
-        return { status: null, stdout: "", stderr: "", error };
+        return { status: null, stdout: "", stderr: "", error, stop: null };
       } finally {
         if (handle) { try { await provider.destroy(handle); } catch { /* teardown must never throw */ } }
       }

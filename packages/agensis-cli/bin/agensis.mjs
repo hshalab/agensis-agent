@@ -143,9 +143,16 @@ Options:
   --permission-mode <m>   default, accept_edits, or yolo
   --yolo                  Alias for --permission-mode yolo
   --no-sandbox            Alias for --permission-mode yolo
-  --timeout-ms <ms>       Kill a job after this time, default: 1800000
+  --timeout-ms <ms>       Hard ceiling on one job, default: 1800000
+  --idle-timeout-ms <ms>  Stop a job that produces NOTHING for this long,
+                          default: 540000 (9m). 0 disables it.
   --heartbeat-ms <ms>     Local terminal heartbeat interval, default: 15000
   --max-concurrency <n>   Maximum simultaneous coding CLI jobs, default: 2
+  --session-slots <n>     Warm sessions per workspace+agent, default: 1.
+                          1 keeps today's behaviour (all conversations share one
+                          session). Raising it is what lets --max-concurrency
+                          actually run jobs in parallel, and stops separate
+                          conversations sharing one runtime history.
   --cursorbuddy-port <n>  Local CursorBuddy discovery/chat port, default: 8787
   --cursorbuddy-bridge    Enable local CursorBuddy discovery/chat bridge
   --no-cursorbuddy-bridge Disable local CursorBuddy discovery/chat bridge

@@ -103,6 +103,13 @@ test('daemon honors the hub auth, register, job, delta, and result contract', { 
     assert.equal(result.jobId, 'job-wire');
     assert.equal(result.response, 'wire-ok');
     assert.equal(result.error, '');
+    // WIRE COMPATIBILITY, both directions. This job runs through LocalExecutor
+    // (a --coding-cmd with a path in it is never a pooled family), which has no
+    // structured result to read, so the frame must look EXACTLY as it did before
+    // stop reasons existed. An old server reading a new daemon sees no new keys;
+    // a new server reading this sees absent, which it treats as unknown.
+    assert.equal(result.stopReason, undefined, 'a runtime that cannot report a reason must not invent one');
+    assert.equal(result.stopDetail, undefined);
     assert.ok(frames.some((frame) => frame.action === 'agent_job_delta' && frame.jobId === 'job-wire'));
     const exitCode = await childExit;
     assert.equal(exitCode, 0);

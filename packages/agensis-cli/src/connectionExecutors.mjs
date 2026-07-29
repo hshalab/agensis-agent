@@ -25,8 +25,26 @@
 
 import { spawn } from "node:child_process";
 import { isAllowedByStoredRules, jobPermissionRules } from "./permissions.mjs";
+import { stopFromCodexTurn, stopFromSdkResult, stopValue } from "./stopReasons.mjs";
 
 const DEFAULT_IDLE_CLOSE_MS = 10 * 60 * 1000;
+
+// How long to keep reading a session AFTER interrupting it, hoping the runtime
+// settles the abandoned turn on its own.
+//
+// A turn that stops early (cancel, idle deadline, hard deadline) used to take
+// the whole session down with it, so the next job on that silo paid a cold
+// start for someone else's cancellation. Interrupting and then WATCHING is the
+// difference between "this turn is over" and "this connection is unusable" —
+// two claims that were previously conflated.
+//
+// The drain runs in the BACKGROUND: the caller's result is resolved the instant
+// the deadline fires, exactly as before, so cancelling still feels immediate.
+// The drain only decides whether the session is kept or torn down. If the
+// runtime never settles the turn we are back to today's behaviour — close it —
+// which makes this a bounded bet: best case we keep a warm session, worst case
+// we spent 5s of a background timer finding out we could not.
+const CANCEL_DRAIN_MS = 5 * 1000;
 
 function scrubbedChildEnv(env = {}) {
   const childEnv = { ...process.env, ...env };
@@ -279,9 +297,9 @@ function makeCanUseTool(session, fallbackRequester) {
 }
 
 /**
- * @param {{ queryFn?: Function, idleCloseMs?: number, requestPermission?: Function }} [opts]
+ * @param {{ queryFn?: Function, idleCloseMs?: number, requestPermission?: Function, cancelDrainMs?: number }} [opts]
  */
-export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CLOSE_MS, requestPermission } = {}) {
+export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CLOSE_MS, requestPermission, cancelDrainMs = CANCEL_DRAIN_MS } = {}) {
   const sessions = new Map(); // sessionKey -> one long-lived SDK query + input queue
   const withLock = createKeyedMutex();
 
@@ -290,6 +308,9 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
     if (!session || (expectedSession && session !== expectedSession)) return;
     sessions.delete(sessionKey);
     clearTimeout(session.idleTimer);
+    // Stop any drain watching this session: the question it was asking — is
+    // this connection reusable — has just been answered "no".
+    session.settleDrain?.();
     session.closed = true;
     session.queue.close();
     if (activeResult && session.activeTurn) session.activeTurn.finish(activeResult);
@@ -308,11 +329,49 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
     session.idleTimer.unref?.();
   };
 
+  /**
+   * Interrupt the runtime, then give it CANCEL_DRAIN_MS to settle the turn it
+   * was just told to abandon. The caller has ALREADY been answered — this only
+   * decides whether the session survives for the next job or is torn down.
+   *
+   * Previously every early exit went straight to closeSession, so one person
+   * cancelling cost the next job on that silo a cold start, and we never found
+   * out whether interrupt() was enough on its own. Now we ask.
+   */
+  const drainAfterInterrupt = (sessionKey, session) => {
+    if (session.closed || sessions.get(sessionKey) !== session) return;
+    Promise.resolve(session.query.interrupt?.()).catch(() => { /* the drain timer is the real backstop */ });
+    if (session.settleDrain) return; // one watcher per session is enough
+    const timer = setTimeout(() => {
+      // The runtime never acknowledged the interrupt, so we cannot tell a
+      // finished turn from one still streaming into a transcript nobody is
+      // reading. Tear it down — today's behaviour, now reached on evidence
+      // rather than by default.
+      session.settleDrain = null;
+      closeSession(sessionKey, session);
+    }, cancelDrainMs);
+    timer.unref?.();
+    session.settleDrain = () => {
+      session.settleDrain = null;
+      clearTimeout(timer);
+      // Settled: the runtime is idle and this session is reusable. Put it back
+      // on the normal idle-close schedule rather than leaving it unattended.
+      if (sessions.get(sessionKey) === session) armIdleTimer(sessionKey);
+    };
+  };
+
   const ensureSession = async (sessionKey, opts) => {
     const existing = sessions.get(sessionKey);
     const fingerprint = connectionFingerprint(opts);
-    if (existing && existing.fingerprint === fingerprint && !existing.closed) return existing;
-    if (existing) closeSession(sessionKey, existing);
+    // A session still mid-drain has an interrupted turn that has NOT been seen
+    // to end. Handing it to the next job would let the abandoned turn's output
+    // land in a conversation it has nothing to do with — the session is only
+    // reusable once the drain has settled and proved the runtime went idle.
+    // Closing it here is exactly the behaviour that existed before the drain,
+    // so the worst case is unchanged rather than newly wrong.
+    if (existing && existing.settleDrain) closeSession(sessionKey, existing);
+    else if (existing && existing.fingerprint === fingerprint && !existing.closed) return existing;
+    else if (existing) closeSession(sessionKey, existing);
     if (!queryFn) {
       const mod = await import("@anthropic-ai/claude-agent-sdk");
       queryFn = mod.query;
@@ -338,6 +397,9 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
       closed: false,
       terminalError: null,
       fingerprint,
+      // Set while a bounded post-interrupt drain is watching this session; the
+      // pump calls it when the abandoned turn's terminal result finally lands.
+      settleDrain: null,
     };
     const mcpServers = opts.leanCli && opts.mcp
       ? { agensis: { type: "http", url: opts.mcp.url, headers: { Authorization: "Bearer ${AGENSIS_MCP_TOKEN}" } } }
@@ -384,7 +446,22 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
         for await (const message of query) {
           if (message.session_id) session.sessionId = message.session_id;
           const turn = session.activeTurn;
-          if (!turn) continue;
+          if (!turn) {
+            // An interrupted turn was already resolved for its caller, but the
+            // SDK still owes this session one terminal `result` for it. Seeing
+            // that result is the proof the CLI went idle rather than wedged,
+            // and therefore the proof this session is safe to hand to the next
+            // job. Nothing is emitted from here: the turn's transcript is
+            // closed and re-opening it would append output to a job the human
+            // has already been told is over.
+            if (message.type === "result") session.settleDrain?.();
+            continue;
+          }
+          // ANY message addressed to the live turn is the agent doing something.
+          // Deliberately broader than "text arrived": a turn can spend minutes
+          // inside one tool call without emitting a token, and killing those was
+          // the original complaint that set the server's window to 10 minutes.
+          turn.touch();
           if (message.type === "stream_event") {
             const text = textFromStreamEvent(message.event);
             if (text) {
@@ -392,14 +469,19 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
               turn.onData?.(encodeStreamJsonDelta(text));
             }
           } else if (message.type === "result") {
+            // Everything the SDK knows about how this turn ended. Previously
+            // only `subtype` was read here and the rest was dropped on the
+            // floor, so a turn that hit its token budget and a turn whose tool
+            // was denied arrived downstream as the same opaque string.
+            const stop = stopFromSdkResult(message);
             if (message.subtype === "success") {
               const result = message.result == null ? turn.text : String(message.result);
               turn.onData?.(encodeStreamJsonResult(result));
-              turn.finish({ status: 0, stdout: result, stderr: "", error: null });
+              turn.finish({ status: 0, stdout: result, stderr: "", error: null, stop });
             } else {
               const detail = Array.isArray(message.errors) ? message.errors.filter(Boolean).join("\n") : message.result;
               const error = new Error(detail || `claude-agent-sdk result error: ${message.subtype}`);
-              turn.finish({ status: 1, stdout: turn.text, stderr: error.message, error });
+              turn.finish({ status: 1, stdout: turn.text, stderr: error.message, error, stop });
             }
           } else if (message.type === "assistant") {
             // An assistant message is a COMPLETED block of the turn: its text
@@ -481,12 +563,21 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
         clearTimeout(session.idleTimer);
         session.queue.close();
         if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
+        // A session that dies mid-drain will never settle the abandoned turn.
+        // Release the waiter so its timer does not outlive the session it was
+        // asking about.
+        session.settleDrain?.();
         if (session.activeTurn) {
           session.activeTurn.finish({
             status: null,
             stdout: session.activeTurn.text,
             stderr: String(terminalError?.message || terminalError || ""),
             error: terminalError,
+            // The connection went away underneath a live turn. That is a
+            // materially different answer to "why did it stop" than anything
+            // the agent itself could report, and the one the human most needs:
+            // nothing is wrong with their request, the pipe broke.
+            stop: stopValue("connection_lost"),
           });
         }
       }
@@ -495,24 +586,43 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
   };
 
   const run = (opts) => withLock(opts.sessionKey || "default", async () => {
-    const { sessionKey = "default", prompt, signal, onData, timeoutMs = 0 } = opts;
-    if (signal?.aborted) return { status: null, stdout: "", stderr: "", aborted: true, error: new Error("cancelled") };
+    const { sessionKey = "default", prompt, signal, onData, timeoutMs = 0, idleTimeoutMs = 0 } = opts;
+    if (signal?.aborted) return { status: null, stdout: "", stderr: "", aborted: true, error: new Error("cancelled"), stop: stopValue("cancelled") };
     let session;
     try {
       session = await ensureSession(sessionKey, opts);
     } catch (error) {
-      return { status: null, stdout: "", stderr: "", error };
+      return { status: null, stdout: "", stderr: "", error, stop: stopValue("connection_lost") };
     }
     if (session.closed) {
       const error = session.terminalError || new Error("claude-agent-sdk connection closed");
-      return { status: null, stdout: "", stderr: String(error.message || error), error };
+      return { status: null, stdout: "", stderr: String(error.message || error), error, stop: stopValue("connection_lost") };
     }
 
     clearTimeout(session.idleTimer);
     const result = await new Promise((resolve) => {
       let settled = false;
       let timer = null;
+      let idleTimer = null;
+      // Restart the idle deadline. Hoisted deliberately so `turn.touch` below
+      // can name it: the turn object has to exist before the pump can rearm it,
+      // and the pump is the only thing that knows the agent is still alive.
+      function armIdle() {
+        if (!(idleTimeoutMs > 0) || settled) return;
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          // SILENCE, not slowness: the hard deadline below is what caps a turn
+          // that is working the whole time. Reported as its own reason because
+          // "produced nothing for nine minutes" and "ran for thirty minutes"
+          // need different answers from the human reading it.
+          const error = new Error(`no output for ${idleTimeoutMs}ms`);
+          turn.finish({ status: null, stdout: turn.text, stderr: error.message, error, stop: stopValue("idle_timeout") });
+          drainAfterInterrupt(sessionKey, session);
+        }, idleTimeoutMs);
+        idleTimer.unref?.();
+      }
       const turn = {
+        touch: armIdle,
         streamed: "", // tokens of the block being written; reset at each segment
         flushed: "", // tokens of the blocks already closed by a segment
         // Every fallback wants the whole turn, not just the open block.
@@ -535,24 +645,32 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
           if (session.activeTurn === turn) session.activeTurn = null;
           if (signal) signal.removeEventListener("abort", onAbort);
           if (timer) clearTimeout(timer);
+          if (idleTimer) clearTimeout(idleTimer);
           resolve(value);
         },
       };
       const onAbort = () => {
-        const value = { status: null, stdout: turn.text, stderr: "", aborted: true, error: new Error("cancelled") };
-        Promise.resolve(session.query.interrupt?.()).catch(() => {});
-        closeSession(sessionKey, session, value);
+        // Answer the caller NOW — a human who pressed cancel should not wait on
+        // the runtime acknowledging it — and let the drain decide the session's
+        // fate in the background.
+        turn.finish({ status: null, stdout: turn.text, stderr: "", aborted: true, error: new Error("cancelled"), stop: stopValue("cancelled") });
+        drainAfterInterrupt(sessionKey, session);
       };
       session.activeTurn = turn;
       if (signal) signal.addEventListener("abort", onAbort, { once: true });
       if (timeoutMs > 0) {
+        // The HARD ceiling: an absolute cap on the turn no amount of activity
+        // can extend. Distinct from the idle deadline above, which asks a
+        // different question — the two used to be one flat timer, so a wedged
+        // turn and a genuinely long one were indistinguishable.
         timer = setTimeout(() => {
           const error = new Error(`timed out after ${timeoutMs}ms`);
-          Promise.resolve(session.query.interrupt?.()).catch(() => {});
-          closeSession(sessionKey, session, { status: null, stdout: turn.text, stderr: error.message, error });
+          turn.finish({ status: null, stdout: turn.text, stderr: error.message, error, stop: stopValue("hard_timeout") });
+          drainAfterInterrupt(sessionKey, session);
         }, timeoutMs);
         timer.unref?.();
       }
+      armIdle();
       session.queue.push({
         type: "user",
         message: { role: "user", content: prompt },
@@ -731,13 +849,13 @@ export function createCodexAppServerExecutor({ spawnFn = spawn, idleCloseMs = DE
   };
 
   const run = (opts) => withLock(opts.sessionKey || "default", async () => {
-    const { sessionKey = "default", prompt, signal, onData, timeoutMs = 0 } = opts;
-    if (signal?.aborted) return { status: null, stdout: "", stderr: "", aborted: true, error: new Error("cancelled") };
+    const { sessionKey = "default", prompt, signal, onData, timeoutMs = 0, idleTimeoutMs = 0 } = opts;
+    if (signal?.aborted) return { status: null, stdout: "", stderr: "", aborted: true, error: new Error("cancelled"), stop: stopValue("cancelled") };
     let session;
     try {
       session = await ensureSession(sessionKey, opts);
     } catch (error) {
-      return { status: null, stdout: "", stderr: "", error };
+      return { status: null, stdout: "", stderr: "", error, stop: stopValue("connection_lost") };
     }
 
     let streamed = "";
@@ -790,8 +908,11 @@ export function createCodexAppServerExecutor({ spawnFn = spawn, idleCloseMs = DE
           return;
         }
         if (!params || params.threadId !== session.threadId) return;
-        if (method === "turn/started") { turnId = params.turn?.id ?? turnId; return; }
+        if (method === "turn/started") { turnId = params.turn?.id ?? turnId; armIdle(); return; }
         if (turnId && params.turnId && params.turnId !== turnId) return;
+        // Anything the thread says is the agent still working — same rule as the
+        // Claude pump, so a tool-only stretch counts as activity, not silence.
+        armIdle();
         if (method === "item/agentMessage/delta") {
           streamed += params.delta || "";
           onData?.(params.delta || "");
@@ -804,6 +925,7 @@ export function createCodexAppServerExecutor({ spawnFn = spawn, idleCloseMs = DE
             stdout: finalText || streamed,
             stderr: failed ? String(params.turn?.error?.message || params.turn?.error || "") : "",
             error: failed ? new Error(String(params.turn?.error?.message || params.turn?.error || "codex turn failed")) : null,
+            stop: stopFromCodexTurn(params),
           });
         }
       });
@@ -811,7 +933,7 @@ export function createCodexAppServerExecutor({ spawnFn = spawn, idleCloseMs = DE
       const onAbort = () => {
         aborted = true;
         session.rpc.request("turn/interrupt", { threadId: session.threadId }).catch(() => {});
-        const value = { status: null, stdout: streamed, stderr: "", aborted: true, error: new Error("cancelled") };
+        const value = { status: null, stdout: streamed, stderr: "", aborted: true, error: new Error("cancelled"), stop: stopValue("cancelled") };
         finish(value);
         closeSession(sessionKey);
       };
@@ -820,17 +942,37 @@ export function createCodexAppServerExecutor({ spawnFn = spawn, idleCloseMs = DE
       const timer = timeoutMs > 0 ? setTimeout(() => {
         const error = new Error(`timed out after ${timeoutMs}ms`);
         session.rpc.request("turn/interrupt", { threadId: session.threadId }).catch(() => {});
-        finish({ status: null, stdout: streamed, stderr: error.message, error });
+        finish({ status: null, stdout: streamed, stderr: error.message, error, stop: stopValue("hard_timeout") });
         closeSession(sessionKey);
       }, timeoutMs) : null;
       timer?.unref?.();
+
+      // Codex keeps its session in a child process rather than an SDK pump, so
+      // there is nothing to drain: an app-server that has gone quiet is killed
+      // and respawned on the next job. The idle deadline exists here for the
+      // reason it exists on the Claude side — so a silent wedge is REPORTED as
+      // silence instead of waiting out the 30-minute ceiling.
+      let idleTimer = null;
+      function armIdle() {
+        if (!(idleTimeoutMs > 0) || settled) return;
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          const error = new Error(`no output for ${idleTimeoutMs}ms`);
+          session.rpc.request("turn/interrupt", { threadId: session.threadId }).catch(() => {});
+          finish({ status: null, stdout: streamed, stderr: error.message, error, stop: stopValue("idle_timeout") });
+          closeSession(sessionKey);
+        }, idleTimeoutMs);
+        idleTimer.unref?.();
+      }
 
       function cleanup() {
         offMessage();
         if (signal) signal.removeEventListener("abort", onAbort);
         if (timer) clearTimeout(timer);
+        if (idleTimer) clearTimeout(idleTimer);
       }
 
+      armIdle();
       session.rpc.request("turn/start", { threadId: session.threadId, input: [{ type: "text", text: prompt }] })
         .then((started) => { turnId = started?.turn?.id || turnId; })
         .catch((error) => finish({ status: null, stdout: "", stderr: "", error }));

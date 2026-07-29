@@ -190,7 +190,7 @@ test('codex app-server executor: a spawn failure (binary missing) resolves an er
 
 // --- Claude Agent SDK fakes -------------------------------------------------
 
-function fakeClaudeQuery({ deltas = ['OK'], finalResult = 'OK', subtype = 'success' } = {}) {
+function fakeClaudeQuery({ deltas = ['OK'], finalResult = 'OK', subtype = 'success', resultFields = {} } = {}) {
   const pushed = [];
   let calls = 0;
   const queryFn = ({ prompt }) => {
@@ -204,7 +204,7 @@ function fakeClaudeQuery({ deltas = ['OK'], finalResult = 'OK', subtype = 'succe
         for (const text of turnDeltas) {
           yield { type: 'stream_event', session_id: 's1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text } } };
         }
-        yield { type: 'result', subtype, result: subtype === 'success' ? turnResult : 'sdk error', session_id: 's1' };
+        yield { type: 'result', subtype, result: subtype === 'success' ? turnResult : 'sdk error', session_id: 's1', ...resultFields };
       }
     })();
     gen.interrupt = async () => {};
@@ -610,4 +610,269 @@ test('claude sdk executor: asks the SDK for adaptive thinking', async () => {
   const ex = createClaudeSdkExecutor({ queryFn: (args) => { seen = args.options; return queryFn(args); } });
   await ex.run({ cwd: '/tmp', prompt: 'hi', sessionKey: 'silo-thinking-opt' });
   assert.deepEqual(seen.thinking, { type: 'adaptive' });
+});
+
+// --- Structured stop reasons and the two deadlines ---------------------------
+//
+// Everything below drives the REAL createClaudeSdkExecutor rather than the pure
+// mapper in stopReasons.mjs (which has its own vitest suite). The point of these
+// is the wiring: the SDK's terminal fields used to be read and thrown away one
+// line later, and no unit test of a mapper can catch that.
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * A Claude SDK fake whose turns do NOT end on their own. Messages are pushed in
+ * by the test, so a turn can be held open to exercise silence, cancellation and
+ * the post-interrupt drain — none of which are reachable with a generator that
+ * always yields a result.
+ */
+function manualClaudeQuery() {
+  const pushed = [];
+  const interrupts = [];
+  let calls = 0;
+  let outbox = [];
+  let waiting = null;
+
+  const emit = (message) => {
+    if (waiting) {
+      const resolve = waiting;
+      waiting = null;
+      resolve({ value: message, done: false });
+    } else {
+      outbox.push(message);
+    }
+  };
+
+  const closes = [];
+  const queryFn = ({ prompt }) => {
+    calls += 1;
+    outbox = [];
+    void (async () => { for await (const input of prompt) pushed.push(input); })();
+    let closed = false;
+    const gen = {
+      [Symbol.asyncIterator]: () => ({
+        next: () => {
+          if (outbox.length) return Promise.resolve({ value: outbox.shift(), done: false });
+          if (closed) return Promise.resolve({ value: undefined, done: true });
+          return new Promise((resolve) => { waiting = resolve; });
+        },
+      }),
+    };
+    gen.interrupt = async () => { interrupts.push(Date.now()); };
+    gen.close = () => {
+      closes.push(Date.now());
+      closed = true;
+      if (waiting) { const resolve = waiting; waiting = null; resolve({ value: undefined, done: true }); }
+    };
+    return gen;
+  };
+
+  return { queryFn, emit, pushed, interrupts, closes, calls: () => calls };
+}
+
+test('claude sdk executor: a failed result reports WHY, not just that it failed', async () => {
+  const { createClaudeSdkExecutor } = await load();
+  const { queryFn } = fakeClaudeQuery({ subtype: 'error_max_turns' });
+  const ex = createClaudeSdkExecutor({ queryFn });
+
+  const result = await ex.run({ cwd: '/tmp', prompt: 'x', sessionKey: 'silo-stop-1', onData: () => {} });
+
+  assert.equal(result.status, 1);
+  assert.equal(result.stop.reason, 'max_turns');
+  assert.equal(result.stop.detail, 'error_max_turns');
+});
+
+test('claude sdk executor: a successful result carries its terminal reason, turns and cost', async () => {
+  const { createClaudeSdkExecutor } = await load();
+  const { queryFn } = fakeClaudeQuery({
+    resultFields: {
+      terminal_reason: 'budget_exhausted',
+      num_turns: 5,
+      total_cost_usd: 1.25,
+      permission_denials: [{ tool_name: 'Bash' }],
+      usage: { input_tokens: 10 },
+    },
+  });
+  const ex = createClaudeSdkExecutor({ queryFn });
+
+  const result = await ex.run({ cwd: '/tmp', prompt: 'x', sessionKey: 'silo-stop-2', onData: () => {} });
+
+  assert.equal(result.status, 0);
+  assert.equal(result.stop.reason, 'max_budget');
+  assert.equal(result.stop.numTurns, 5);
+  assert.equal(result.stop.costUsd, 1.25);
+  assert.equal(result.stop.permissionDenials, 1);
+  assert.deepEqual(result.stop.usage, { input_tokens: 10 });
+});
+
+test('claude sdk executor: a turn that goes SILENT stops on the idle deadline, and activity rearms it', async () => {
+  const { createClaudeSdkExecutor } = await load();
+  const { queryFn, emit, interrupts } = manualClaudeQuery();
+  const ex = createClaudeSdkExecutor({ queryFn, cancelDrainMs: 20 });
+
+  const seen = [];
+  const running = ex.run({
+    cwd: '/tmp', prompt: 'x', sessionKey: 'silo-idle-1', onData: (chunk) => seen.push(chunk),
+    // The hard ceiling is far away: whatever stops this turn, it is not that.
+    idleTimeoutMs: 60, timeoutMs: 10_000,
+  });
+
+  // Three ticks of activity spaced INSIDE the idle window. Each one has to push
+  // the deadline out, or the turn dies during this loop and the later deltas
+  // never reach onData.
+  for (let i = 0; i < 3; i += 1) {
+    await sleep(35);
+    emit({ type: 'stream_event', session_id: 's1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: '.' } } });
+  }
+
+  const result = await running;
+
+  assert.equal(result.stop.reason, 'idle_timeout');
+  // Survived ~105ms on a 60ms idle deadline: proof the deltas rearmed it.
+  assert.equal(seen.length, 3);
+  assert.equal(interrupts.length, 1, 'the idle deadline interrupts the runtime');
+});
+
+test('claude sdk executor: the hard ceiling still fires for a turn that never goes idle', async () => {
+  const { createClaudeSdkExecutor } = await load();
+  const { queryFn, emit } = manualClaudeQuery();
+  const ex = createClaudeSdkExecutor({ queryFn, cancelDrainMs: 20 });
+
+  const running = ex.run({
+    cwd: '/tmp', prompt: 'x', sessionKey: 'silo-hard-1', onData: () => {},
+    // Chattering constantly, so the idle deadline can never fire — only the
+    // absolute ceiling can end this.
+    idleTimeoutMs: 60, timeoutMs: 120,
+  });
+  const chatter = setInterval(() => {
+    emit({ type: 'stream_event', session_id: 's1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: '.' } } });
+  }, 15);
+
+  const result = await running;
+  clearInterval(chatter);
+
+  assert.equal(result.stop.reason, 'hard_timeout');
+});
+
+test('claude sdk executor: a cancelled turn whose runtime settles KEEPS the warm session', async () => {
+  const { createClaudeSdkExecutor } = await load();
+  const { queryFn, emit, calls, interrupts } = manualClaudeQuery();
+  const ex = createClaudeSdkExecutor({ queryFn, cancelDrainMs: 500 });
+  const controller = new AbortController();
+
+  const running = ex.run({
+    cwd: '/tmp', prompt: 'first', sessionKey: 'silo-drain-keep', onData: () => {}, signal: controller.signal,
+  });
+  await sleep(20);
+  controller.abort();
+  const result = await running;
+
+  assert.equal(result.aborted, true);
+  assert.equal(result.stop.reason, 'cancelled');
+  assert.equal(interrupts.length, 1);
+
+  // The runtime acknowledges the interrupt by settling the abandoned turn. That
+  // is the evidence the connection is idle and reusable.
+  emit({ type: 'result', subtype: 'success', result: '', session_id: 's1' });
+  await sleep(30);
+
+  const secondRun = ex.run({ cwd: '/tmp', prompt: 'second', sessionKey: 'silo-drain-keep', onData: () => {} });
+  await sleep(20);
+  emit({ type: 'result', subtype: 'success', result: 'second', session_id: 's1' });
+  const second = await secondRun;
+
+  assert.equal(second.stdout, 'second');
+  assert.equal(calls(), 1, 'the session was reused rather than rebuilt after the cancel');
+});
+
+test('claude sdk executor: a cancelled turn whose runtime never settles tears the session down', async () => {
+  const { createClaudeSdkExecutor } = await load();
+  const { queryFn, emit, calls, closes } = manualClaudeQuery();
+  const ex = createClaudeSdkExecutor({ queryFn, cancelDrainMs: 30 });
+  const controller = new AbortController();
+
+  const running = ex.run({
+    cwd: '/tmp', prompt: 'first', sessionKey: 'silo-drain-drop', onData: () => {}, signal: controller.signal,
+  });
+  await sleep(20);
+  controller.abort();
+  await running;
+
+  // Nothing is emitted: the runtime is wedged.
+  assert.equal(closes.length, 0, 'the session is still open while the drain is watching');
+  await sleep(90);
+  // The drain expired on its OWN — no second job was needed to notice. Asserting
+  // this before the next run matters: ensureSession would also close an
+  // un-settled session, so without this line the test passes even with the
+  // drain's give-up removed entirely.
+  assert.equal(closes.length, 1, 'an expired drain tears the session down by itself');
+
+  const secondRun = ex.run({ cwd: '/tmp', prompt: 'second', sessionKey: 'silo-drain-drop', onData: () => {} });
+  await sleep(20);
+  emit({ type: 'result', subtype: 'success', result: 'second', session_id: 's1' });
+  const second = await secondRun;
+
+  assert.equal(second.stdout, 'second');
+  assert.equal(calls(), 2, 'a wedged session is replaced, not handed to the next job');
+});
+
+test('claude sdk executor: a job arriving MID-drain never inherits the interrupted session', async () => {
+  const { createClaudeSdkExecutor } = await load();
+  const { queryFn, emit, calls } = manualClaudeQuery();
+  // A long drain window, so the second job genuinely lands while it is open.
+  const ex = createClaudeSdkExecutor({ queryFn, cancelDrainMs: 5_000 });
+  const controller = new AbortController();
+
+  const running = ex.run({
+    cwd: '/tmp', prompt: 'first', sessionKey: 'silo-drain-race', onData: () => {}, signal: controller.signal,
+  });
+  await sleep(20);
+  controller.abort();
+  await running;
+
+  // No settle: the first turn may still be streaming. Whatever it emits must not
+  // land in the next conversation.
+  const secondRun = ex.run({ cwd: '/tmp', prompt: 'second', sessionKey: 'silo-drain-race', onData: () => {} });
+  await sleep(20);
+  emit({ type: 'result', subtype: 'success', result: 'second', session_id: 's1' });
+  const second = await secondRun;
+
+  assert.equal(second.stdout, 'second');
+  assert.equal(calls(), 2, 'an un-settled session is rebuilt rather than shared across turns');
+});
+
+test('claude sdk executor: a connection that dies under a live turn reports connection_lost', async () => {
+  const { createClaudeSdkExecutor } = await load();
+  const queryFn = ({ prompt }) => {
+    const gen = (async function* () {
+      for await (const input of prompt) {
+        void input;
+        return; // the SDK stream ends underneath the turn
+      }
+    })();
+    gen.interrupt = async () => {};
+    return gen;
+  };
+  const ex = createClaudeSdkExecutor({ queryFn });
+
+  const result = await ex.run({ cwd: '/tmp', prompt: 'x', sessionKey: 'silo-lost-1', onData: () => {} });
+
+  assert.equal(result.stop.reason, 'connection_lost');
+});
+
+test('codex app-server executor: turn/completed carries a stop reason for both outcomes', async () => {
+  const { createCodexAppServerExecutor } = await load();
+
+  const okChild = fakeCodexChild();
+  scriptedCodexServer(okChild, { deltas: ['hi'] });
+  const okEx = createCodexAppServerExecutor({ spawnFn: () => okChild });
+  const ok = await okEx.run({ cwd: '/tmp', prompt: 'x', sessionKey: 'codex-stop-ok', onData: () => {} });
+  assert.equal(ok.stop.reason, 'completed');
+
+  const badChild = fakeCodexChild();
+  scriptedCodexServer(badChild, { deltas: ['hi'], fail: true });
+  const badEx = createCodexAppServerExecutor({ spawnFn: () => badChild });
+  const bad = await badEx.run({ cwd: '/tmp', prompt: 'x', sessionKey: 'codex-stop-bad', onData: () => {} });
+  assert.equal(bad.stop.reason, 'agent_error');
 });

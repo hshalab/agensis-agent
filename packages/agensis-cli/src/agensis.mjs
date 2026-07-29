@@ -19,6 +19,8 @@ import {
 import { summarizeToolInput } from "./connectionExecutors.mjs";
 import { createPermissionBroker } from "./permissions.mjs";
 import { createQueue } from "./queue.mjs";
+import { stopFromAmpResult } from "./stopReasons.mjs";
+import { createSessionSlots } from "./sessionSlots.mjs";
 import { startCursorBuddyLocalBridge } from "./cursorbuddyLocalBridge.mjs";
 import { deriveMemoryRoot, snapshotMemory, memoryFingerprint } from "./memory.mjs";
 import { detectCommandEntries, detectSkillNames } from "./slashEnum.mjs";
@@ -40,11 +42,34 @@ import {
 } from "./state.mjs";
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
+// The IDLE deadline: how long a turn may produce nothing at all before the
+// daemon stops it. Distinct from DEFAULT_TIMEOUT_MS above, which is the hard
+// ceiling on a turn that is working the whole time.
+//
+// 9 minutes is deliberately just INSIDE the server's 10-minute content-silence
+// reaper (AGENT_JOB_IDLE_REAP_MINUTES in server/agent-jobs.cjs). Only the daemon
+// can actually stop the work; the server can only rewrite the row. Letting the
+// server win first means telling the human "it stopped responding" while a CLI
+// keeps running on someone's laptop for another twenty minutes. Letting the
+// daemon win first means the turn really is over and we can say WHY.
+//
+// These two numbers are a pair in two different repos. Moving either one without
+// the other silently inverts which side decides — hence the named constant and
+// this comment on both sides.
+const DEFAULT_IDLE_TIMEOUT_MS = 9 * 60 * 1000;
 const DEFAULT_HEARTBEAT_MS = 15 * 1000;
 // How many conversations may run at once. Each DM / channel / thread is its own
 // serial lane; this caps how many lanes run in parallel so we never spawn an
 // unbounded number of coding-CLI subprocesses. Override with --max-concurrency.
 const DEFAULT_MAX_CONCURRENCY = 2;
+// How many warm sessions one silo (workspace+agent) may hold at once.
+//
+// DEFAULT 1 = today's behaviour, exactly: every lane shares one sessionKey and
+// one connection, which is what a daemon does now. Raising it is what makes
+// --max-concurrency mean anything (see sessionSlots.mjs for why it is currently
+// a no-op), and it also stops conversations sharing one runtime history — a
+// visible change, so it is opt-in for a release.
+const DEFAULT_SESSION_SLOTS = 1;
 const LEAN_PROMPT_MAX_BYTES = 10 * 1024;
 const DEFAULT_MODEL = "claude-opus-4-8";
 export const AGENSIS_CLI_VERSION = "0.1.44";
@@ -719,8 +744,22 @@ function normalizeConfig(raw) {
     model: resolveExecutionModel(raw.model || process.env.AGENSIS_MODEL || process.env.CLAUDE_MODEL || "", executionRuntime),
     permissionMode: normalizePermissionMode(raw.permissionMode || raw.permission_mode || raw.permission || process.env.AGENSIS_PERMISSION_MODE || "default"),
     timeoutMs: Number(raw.timeoutMs || process.env.AGENSIS_TIMEOUT_MS || DEFAULT_TIMEOUT_MS),
+    // Clamped to the hard ceiling: an idle deadline LONGER than the hard one can
+    // never fire, which would look like the flag silently doing nothing. 0 (or a
+    // negative) disables it and restores the single-flat-timer behaviour.
+    idleTimeoutMs: Math.min(
+      Number(raw.idleTimeoutMs ?? process.env.AGENSIS_IDLE_TIMEOUT_MS ?? DEFAULT_IDLE_TIMEOUT_MS) || 0,
+      Number(raw.timeoutMs || process.env.AGENSIS_TIMEOUT_MS || DEFAULT_TIMEOUT_MS),
+    ),
     heartbeatMs: Number(raw.heartbeatMs || process.env.AGENSIS_HEARTBEAT_MS || DEFAULT_HEARTBEAT_MS),
     maxConcurrency: Math.max(1, Number(raw.maxConcurrency || process.env.AGENSIS_MAX_CONCURRENCY || DEFAULT_MAX_CONCURRENCY) || DEFAULT_MAX_CONCURRENCY),
+    // Clamped to [1, maxConcurrency]: more slots than the queue will ever use is
+    // pure memory, and every slot is a live coding-CLI process on someone's
+    // machine.
+    sessionSlots: Math.min(
+      Math.max(1, Number(raw.sessionSlots || process.env.AGENSIS_SESSION_SLOTS || DEFAULT_SESSION_SLOTS) || DEFAULT_SESSION_SLOTS),
+      Math.max(1, Number(raw.maxConcurrency || process.env.AGENSIS_MAX_CONCURRENCY || DEFAULT_MAX_CONCURRENCY) || DEFAULT_MAX_CONCURRENCY),
+    ),
     once: Boolean(raw.once || process.env.AGENSIS_ONCE === "1"),
     exitOnOnce: Boolean(raw.exitOnOnce),
     onRegistered: typeof raw.onRegistered === "function" ? raw.onRegistered : null,
@@ -826,6 +865,14 @@ function isLocalBackendUrl(baseUrl) {
 // and a thread within a channel is distinct again — matching the server's own
 // per-conversation lock granularity (sessionId::threadParentId). Same lane → runs
 // in order; different lanes → run in parallel.
+// One allocator for the process, built from the first config it sees. Slots are
+// a property of this daemon's configuration, not of any single job.
+let sessionSlotsSingleton = null;
+function sessionSlotsFor(config) {
+  if (!sessionSlotsSingleton) sessionSlotsSingleton = createSessionSlots({ slots: config.sessionSlots });
+  return sessionSlotsSingleton;
+}
+
 function laneKeyForJob(job) {
   const session = String(job?.sessionId || "");
   const thread = String(job?.threadParentId || "");
@@ -1087,12 +1134,24 @@ async function runAgentJob(config, job, { signal, requestPermission = null }) {
     ? (isClaudeCommand(command.cmd) ? "claude" : isCodexCommand(command.cmd) ? "codex" : null)
     : null;
   const executor = createExecutor(job, { family });
-  const result = await executor.run({
+  // Which warm session this conversation runs on. The SILO (workspace+agent) is
+  // what a session is scoped to; the SLOT says which of that silo's sessions.
+  // At the default of one slot every lane resolves to slot 0, so the key is
+  // stable and the behaviour is identical to before slots existed.
+  const silo = `${job.workspaceId || config.workspace || ""}:${config.agent || config.handle || ""}`;
+  const slots = sessionSlotsFor(config);
+  const slot = slots.claim(silo, laneKeyForJob(job));
+  const running = executor.run({
     cmd: command.cmd,
     args: [...command.args, prompt],
     env: command.env,
     cwd: job.cwd || config.cwd,
     timeoutMs: config.timeoutMs,
+    // The two deadlines are handed over as a PAIR. timeoutMs caps a turn that is
+    // working; idleTimeoutMs catches one that has gone silent. Only the pooled
+    // connection executors honour the second — LocalExecutor still has the one
+    // flat timer, which is a real gap and is called out in AGENTS.md.
+    idleTimeoutMs: config.idleTimeoutMs,
     heartbeatMs: config.heartbeatMs,
     label: "agent job",
     signal,
@@ -1107,7 +1166,7 @@ async function runAgentJob(config, job, { signal, requestPermission = null }) {
     hostFolders: resolveAdditionalDirectories(config, job),
     leanCli: config.leanCli,
     mcp: config.leanCli ? leanMcpRuntime(config) : null,
-    sessionKey: `${job.workspaceId || config.workspace || ""}:${config.agent || config.handle || ""}`,
+    sessionKey: `${silo}#${slot}`,
     clientVersion: AGENSIS_CLI_VERSION,
     // Interactive approvals. Absent (peer-relayed jobs, tests) the pooled
     // executors keep their pre-broker behaviour: deny rather than self-approve.
@@ -1127,6 +1186,17 @@ async function runAgentJob(config, job, { signal, requestPermission = null }) {
       }
     },
   });
+  let result;
+  try {
+    result = await running;
+  } finally {
+    // `finally`, because it is the only place that holds for every exit — a
+    // normal return, a rejection, and cancellation alike. (A synchronous throw
+    // from executor.run itself would slip past this, which is survivable only
+    // because a leaked claim costs slot PREFERENCE and never capacity; see
+    // sessionSlots.mjs.)
+    slots.release(silo, slot);
+  }
   clearInterval(progressTimer);
 
   if (parser) {
@@ -1146,11 +1216,25 @@ async function runAgentJob(config, job, { signal, requestPermission = null }) {
     ? parser.result || (error ? "" : stderr)
     : stdout || (error ? "" : stderr) || latest || "";
 
+  // Why the turn ended, in the shared vocabulary (stopReasons.mjs). Absent when
+  // the executor could not tell us — LocalExecutor's raw subprocess has no
+  // structured result to read — and the server treats absent exactly as it
+  // treated every result before this field existed.
+  const stop = result.stop && typeof result.stop === "object" ? result.stop : null;
   sendResult(job, {
     action: "agent_job_result",
     jobId: job.id,
     response,
     error,
+    ...(stop ? {
+      stopReason: stop.reason,
+      stopDetail: stop.detail || "",
+      numTurns: stop.numTurns || 0,
+      // Per-turn spend. Stored server-side, deliberately NOT rendered or
+      // broadcast in v1 — agent_jobs.metadata is fanned out to clients.
+      costUsd: stop.costUsd || 0,
+      permissionDenials: stop.permissionDenials || 0,
+    } : {}),
     elapsedMs: Date.now() - started,
     model: command.model,
     permissionMode: command.permissionMode,
@@ -1192,12 +1276,18 @@ async function runAmpAgentJob(config, job, { signal, started = Date.now() } = {}
   });
   const finish = ({ response = "", error = "", errorCode = "", threadId = "" } = {}) => {
     const ampThreadId = validAmpThreadId(threadId);
+    // Amp's own amp_* codes folded onto the shared vocabulary, so ONE reader
+    // downstream handles all three runtimes instead of the server special-casing
+    // whichever one produced the turn.
+    const stop = stopFromAmpResult(errorCode, Boolean(error));
     sendResult(job, {
       action: "agent_job_result",
       jobId: job.id,
       response,
       error,
       errorCode: errorCode || undefined,
+      stopReason: stop.reason,
+      stopDetail: stop.detail || "",
       elapsedMs: Date.now() - started,
       model,
       permissionMode,
