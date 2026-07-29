@@ -258,6 +258,42 @@ const MAX_IDENTITY_BYTES = 16 * 1024;
 const IDENTITY_TEXT_FIELDS = ["name", "avatar", "accent_color", "description", "soul"];
 const IDENTITY_VOICE_FIELDS = ["cartesia_voice_id", "voice_id", "id", "speed", "emotion", "attitude"];
 
+// Read the daemon-owned liveness file back.
+//
+// The supervisor needs this to answer "is this daemon safe to restart right now?".
+// A heartbeat is only meaningful while it is FRESH — a daemon that died mid-turn
+// leaves its last beat on disk saying busy:true forever, and a supervisor that
+// trusted it would refuse to ever update again.
+export async function readHeartbeatFile(config) {
+  try {
+    const raw = await fsp.readFile(path.join(resolveStateDir(config), HEARTBEAT_FILE), "utf8");
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+// Is this daemon safe to stop and replace right now?
+//
+// An update stops the running daemon. Doing that mid-turn destroys the work — the
+// exact failure this project spent today fixing on the server side (a turn killed
+// by a liveness reaper loses its answer). So an automatic update waits for idle;
+// an operator-requested one is not gated by this.
+//
+// A MISSING or STALE beat counts as idle, deliberately. Missing means the daemon
+// never wrote one (nothing to lose); stale means it is not running or not beating,
+// in which case replacing it is the repair, not the risk.
+export function isDaemonIdle(beat, { now = Date.now(), staleAfterMs = 60_000 } = {}) {
+  if (!beat || typeof beat !== "object") return true;
+  const ts = Number(beat.ts || 0);
+  if (!ts || now - ts > staleAfterMs) return true;
+  if (beat.busy) return false;
+  if (Number(beat.active || 0) > 0) return false;
+  if (Number(beat.queueSize || 0) > 0) return false;
+  return true;
+}
+
 export function identityFilePath(config) {
   return path.join(resolveStateDir(config), IDENTITY_FILE);
 }

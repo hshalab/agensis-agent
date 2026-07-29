@@ -157,6 +157,58 @@ export async function defaultHealthCheck({ config, pid, timeoutMs = DEFAULT_HEAL
 // this can be exercised against fakes; the exported `default*` functions above are the
 // real implementations. Always writes update.json (state.mjs) with the outcome, so an
 // agent that requested the update can read back whether it landed or was rolled back.
+/**
+ * Compare two x.y.z versions. Returns >0 if a is newer than b.
+ *
+ * Deliberately numeric-only, no semver dependency: this package's versions are
+ * plain three-part numbers, and a string compare would rank "0.1.9" above
+ * "0.1.10" — which is exactly the release this daemon would then refuse to take.
+ * Anything unparseable sorts as older, so a malformed registry answer can never
+ * trigger an update.
+ */
+export function compareVersions(a, b) {
+  const parse = (v) => String(v || "").trim().split(".").map((n) => Number.parseInt(n, 10));
+  const left = parse(a);
+  const right = parse(b);
+  for (let i = 0; i < 3; i += 1) {
+    const l = Number.isFinite(left[i]) ? left[i] : -1;
+    const r = Number.isFinite(right[i]) ? right[i] : -1;
+    if (l !== r) return l - r;
+  }
+  return 0;
+}
+
+/**
+ * Ask the npm registry what the newest published version is.
+ *
+ * A plain HTTPS GET of the `latest` dist-tag rather than shelling out to
+ * `npm view`: no child process per poll, no dependence on an npm binary being on
+ * the supervisor's PATH, and no risk of inheriting a registry auth config that
+ * happens to be pointed somewhere else.
+ *
+ * Returns null on ANY failure — offline, rate-limited, malformed. A version check
+ * that cannot reach the network must leave the running daemon exactly as it is,
+ * never throw into the supervisor loop.
+ */
+export async function defaultFetchLatestVersion({ packageName = PACKAGE_NAME, timeoutMs = 10_000 } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`https://registry.npmjs.org/${packageName}/latest`, {
+      headers: { accept: "application/vnd.npm.install-v1+json, application/json" },
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    const body = await res.json();
+    const version = body && typeof body.version === "string" ? body.version.trim() : "";
+    return version || null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function performSelfUpdate({
   config,
   targetVersion,

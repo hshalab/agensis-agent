@@ -133,3 +133,90 @@ describe('runSupervisor', () => {
     expect(await readUpdateRequest(config)).not.toBeNull();
   });
 });
+
+// --- automatic updates -------------------------------------------------------
+//
+// The supervisor could already carry out an update; nothing ever told it one
+// existed. Jason asked whether daemons auto-update, and the honest answer was
+// "the machinery is there but request-driven, so nothing fires". These cover the
+// registry check and, more importantly, the two guards on acting on it.
+
+function beat(overrides: Record<string, unknown> = {}) {
+  return { ts: Date.now(), busy: false, active: 0, queueSize: 0, ...overrides };
+}
+
+/**
+ * Run one auto-check tick and report what the supervisor decided to install.
+ *
+ * Each call gets its OWN agent id: update state is persisted per agent under the
+ * shared home, so two calls in one test would otherwise share it and the second
+ * would see itself already updated — passing for the wrong reason.
+ */
+let autoCheckSeq = 0;
+async function runAutoCheck({
+  latest, current = '0.1.0', heartbeat = beat(),
+}: { latest: string | null; current?: string; heartbeat?: Record<string, unknown> | null }) {
+  const installed: string[] = [];
+  autoCheckSeq += 1;
+  await runSupervisor({
+    config: { ...config, agent: `agent-auto-${autoCheckSeq}` },
+    runningVersion: current,
+    root,
+    pollIntervalMs: 1,
+    autoUpdate: true,
+    autoCheckIntervalMs: 0, // check on the first tick
+    fetchLatestVersionFn: async () => latest,
+    readHeartbeatFn: async () => heartbeat,
+    installFn: async (args: any) => { installed.push(args.version); return fakeInstall(args); },
+    spawnFn: () => fakeChild(),
+    stopFn: async () => {},
+    healthCheckFn: async () => true,
+    maxIterations: 1,
+    log: () => {},
+  });
+  // The bootstrap install of the running version is not an update.
+  return installed.filter(v => v !== current);
+}
+
+describe('runSupervisor auto-update', () => {
+  it('takes a newer published version when the daemon is idle', async () => {
+    expect(await runAutoCheck({ latest: '0.1.42' })).toEqual(['0.1.42']);
+  });
+
+  it('does NOT update while the daemon is mid-turn', async () => {
+    // An update stops the daemon, and stopping it mid-turn destroys that turn's
+    // work — the exact class of failure this project spent the day fixing.
+    expect(await runAutoCheck({ latest: '0.1.42', heartbeat: beat({ busy: true }) })).toEqual([]);
+    expect(await runAutoCheck({ latest: '0.1.42', heartbeat: beat({ active: 1 }) })).toEqual([]);
+    expect(await runAutoCheck({ latest: '0.1.42', heartbeat: beat({ queueSize: 3 }) })).toEqual([]);
+  });
+
+  it('treats a stale or missing heartbeat as idle, so a dead daemon can be repaired', async () => {
+    const stale = beat({ ts: Date.now() - 10 * 60_000, busy: true });
+    expect(await runAutoCheck({ latest: '0.1.42', heartbeat: stale })).toEqual(['0.1.42']);
+    expect(await runAutoCheck({ latest: '0.1.42', heartbeat: null })).toEqual(['0.1.42']);
+  });
+
+  it('never walks backwards onto an older or equal version', async () => {
+    expect(await runAutoCheck({ latest: '0.0.9', current: '0.1.0' })).toEqual([]);
+    expect(await runAutoCheck({ latest: '0.1.0', current: '0.1.0' })).toEqual([]);
+  });
+
+  it('does nothing when the registry is unreachable', async () => {
+    expect(await runAutoCheck({ latest: null })).toEqual([]);
+  });
+
+  it('stays put unless autoUpdate is switched on', async () => {
+    const installed: string[] = [];
+    await runSupervisor({
+      config, runningVersion: '0.1.0', root, pollIntervalMs: 1,
+      autoCheckIntervalMs: 0,
+      fetchLatestVersionFn: async () => '0.1.42',
+      readHeartbeatFn: async () => beat(),
+      installFn: async (args: any) => { installed.push(args.version); return fakeInstall(args); },
+      spawnFn: () => fakeChild(), stopFn: async () => {}, healthCheckFn: async () => true,
+      maxIterations: 1, log: () => {},
+    });
+    expect(installed.filter(v => v !== '0.1.0')).toEqual([]);
+  });
+});
