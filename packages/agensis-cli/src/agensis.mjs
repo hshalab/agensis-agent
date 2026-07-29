@@ -72,7 +72,7 @@ const DEFAULT_MAX_CONCURRENCY = 2;
 const DEFAULT_SESSION_SLOTS = 1;
 const LEAN_PROMPT_MAX_BYTES = 10 * 1024;
 const DEFAULT_MODEL = "claude-opus-4-8";
-export const AGENSIS_CLI_VERSION = "0.1.44";
+export const AGENSIS_CLI_VERSION = "0.1.45";
 
 export async function runAgensisDaemon(rawConfig = {}) {
   const config = normalizeConfig(rawConfig);
