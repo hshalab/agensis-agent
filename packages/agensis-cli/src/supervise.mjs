@@ -46,6 +46,10 @@ const DEFAULT_POLL_MS = 5_000;
 // A crashed daemon is respawned, but with backoff — a version that dies immediately on
 // every launch (not merely "fails its health check once") must not spin the host.
 const RESPAWN_BACKOFF_MS = [1_000, 5_000, 15_000, 30_000];
+// How long a daemon must stay up before its exit counts as "something killed a
+// working daemon" rather than "this daemon cannot start". Longer than the whole
+// backoff ladder (51s), so a crash-looper can never earn a reset.
+const HEALTHY_UPTIME_MS = 60_000;
 
 // How often to ask the registry whether a newer version exists. Deliberately far
 // slower than the update-request poll: an operator asking for a specific version
@@ -109,15 +113,29 @@ export async function runSupervisor({
 
   const spawnCurrent = () => {
     const currentDir = resolveVersionDir(root, state.currentVersion);
+    const spawnedAt = Date.now();
     child = spawnFn({ entry: resolveDaemonEntry(currentDir), profileName });
     child.on?.("exit", (code, sig) => {
       if (stopped) return;
       log(`[supervise] daemon (version ${state.currentVersion}) exited (code=${code} signal=${sig}); respawning`);
+      // Reset the backoff on a daemon that actually RAN, not on one that merely
+      // started. This used to hang off the 'spawn' event, which fires as soon as
+      // the OS hands back a process — so a daemon that crashes on startup (bad
+      // config, port taken, corrupt install) reset the counter to 0 on every
+      // attempt and the escalating backoff below was never reached past its
+      // first entry. The result was a permanent 1-second crash-loop: the exact
+      // hammering the array exists to prevent.
+      //
+      // HEALTHY_UPTIME_MS is the line between "it worked and something later
+      // killed it" and "it cannot start". Comfortably longer than the whole
+      // backoff ladder, so a crash-looper can never accumulate enough uptime to
+      // reset itself.
+      if (Date.now() - spawnedAt >= HEALTHY_UPTIME_MS) respawnAttempt = 0;
       const delay = RESPAWN_BACKOFF_MS[Math.min(respawnAttempt, RESPAWN_BACKOFF_MS.length - 1)];
       respawnAttempt += 1;
+      log(`[supervise] next respawn in ${delay}ms (attempt ${respawnAttempt})`);
       setTimeout(() => { if (!stopped) spawnCurrent(); }, delay).unref?.();
     });
-    child.on?.("spawn", () => { respawnAttempt = 0; });
     return child;
   };
 
