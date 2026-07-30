@@ -126,6 +126,10 @@ export async function runAgensisDaemon(rawConfig = {}) {
   // unreachable for a few minutes.
   const RECONNECT_BASE_MS = 2_000;
   const RECONNECT_MAX_BASE_MS = 30_000;
+  // Silence from the hub after which we stop believing our own socket. Matched
+  // to the hub's LIVENESS_MAX_MISSED_PONGS * LIVENESS_PING_INTERVAL_MS — see the
+  // watchdog in connect().
+  const DEAD_PEER_TIMEOUT_MS = 120_000;
   const nextReconnectDelay = () => {
     const base = Math.min(RECONNECT_BASE_MS * 2 ** reconnectAttempts, RECONNECT_MAX_BASE_MS);
     reconnectAttempts += 1;
@@ -423,6 +427,42 @@ export async function runAgensisDaemon(rawConfig = {}) {
     // by the next connect() and an old socket's late callback must not act on the
     // new one's behalf.
     const socket = ws;
+
+    // Dead-peer detection, from THIS side.
+    //
+    // `send()` decides a socket is usable by asking `readyState === OPEN`, and a
+    // TCP connection that died without a FIN — laptop lid, NAT idle-eviction,
+    // network partition — stays OPEN for as long as the OS keeps the socket. So
+    // send() returned TRUE into a black hole, and sendResult parks a result ONLY
+    // when send() returns false. A turn that finished on a silently-dead socket
+    // was therefore neither delivered nor parked: it was dropped, having run to
+    // completion, while the human was told the agent stopped responding.
+    //
+    // The hub already pings every 15s (LIVENESS_PING_INTERVAL_MS in
+    // server/realtime.cjs), so "nothing inbound for a long time" is a reliable
+    // signal here and needs no new protocol — any frame counts, since a ping is
+    // itself traffic.
+    //
+    // The threshold matches the hub's OWN tolerance (8 missed pongs ≈ 120s)
+    // rather than being tighter. Two reasons: past that point the hub has
+    // terminated us anyway, so the socket is definitively useless and there is
+    // nothing to be gained by holding it; and a daemon piping a long build can
+    // stall its event loop for a minute at a stretch, which is exactly why the
+    // hub's tolerance is 120s and not 30s. Terminating merely forces the normal
+    // close -> reconnect path, where parked results are re-sent.
+    let lastInboundAt = Date.now();
+    const touchInbound = () => { lastInboundAt = Date.now(); };
+    socket.on("ping", touchInbound);
+    socket.on("pong", touchInbound);
+    socket.on("message", touchInbound);
+    const peerWatchdog = setInterval(() => {
+      if (socket !== ws) return;
+      if (Date.now() - lastInboundAt < DEAD_PEER_TIMEOUT_MS) return;
+      log(`No traffic from Agensis for ${Math.round(DEAD_PEER_TIMEOUT_MS / 1000)}s — treating the socket as dead and reconnecting`);
+      try { socket.terminate(); } catch { /* already gone */ }
+    }, 15_000);
+    peerWatchdog.unref?.();
+    socket.on("close", () => clearInterval(peerWatchdog));
 
     ws.on("open", async () => {
       socketRegistered = false;
