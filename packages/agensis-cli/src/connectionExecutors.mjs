@@ -686,12 +686,43 @@ export function createClaudeSdkExecutor({ queryFn, idleCloseMs = DEFAULT_IDLE_CL
   return { run, shutdown: () => { for (const key of [...sessions.keys()]) closeSession(key); } };
 }
 
-/** NDJSON-framed JSON-RPC client over a child process's stdio. */
-function createJsonRpcClient(child) {
+/**
+ * NDJSON-framed JSON-RPC client over a child process's stdio.
+ *
+ * @param child   the spawned process
+ * @param options.requestTimeoutMs  ceiling on a single request. A JSON-RPC
+ *   request that is never answered used to hang FOREVER: the promise is settled
+ *   only from the stdout reader or the exit/error handlers, so a child that is
+ *   alive but wedged (or one that simply never implements the method) settles
+ *   nothing. Because these calls are made under `withLock(sessionKey)`, one such
+ *   request permanently wedges every future job on that session key too — the
+ *   lock is never released. A deadline turns "this agent never answers again"
+ *   into "this turn failed".
+ */
+function createJsonRpcClient(child, { requestTimeoutMs = 120_000 } = {}) {
   let nextId = 1;
   let buffer = "";
+  let exited = false;
   const pending = new Map();
   const messageHandlers = new Set();
+  // Bounded tail of the child's stderr, kept for diagnostics.
+  //
+  // stdio[2] is 'pipe' and NOTHING read it. A pipe nobody drains fills its OS
+  // buffer (~64KB) and then BLOCKS the writer — so a chatty `codex app-server`
+  // does not merely lose its logs, it deadlocks itself mid-write and stops
+  // answering JSON-RPC entirely, which presents as an agent that has silently
+  // stopped. Draining is the fix; keeping a capped tail is the part that makes
+  // the eventual failure diagnosable.
+  let stderrTail = "";
+  const STDERR_TAIL_LIMIT = 8 * 1024;
+  if (child.stderr) {
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderrTail = (stderrTail + chunk).slice(-STDERR_TAIL_LIMIT);
+    });
+    // Never let the drain itself become the unhandled 'error' that kills us.
+    child.stderr.on("error", () => { });
+  }
 
   child.stdout.setEncoding("utf8");
   child.stdout.on("data", (chunk) => {
@@ -715,28 +746,70 @@ function createJsonRpcClient(child) {
   });
 
   const rejectAllPending = (error) => {
-    for (const { reject } of pending.values()) reject(error);
+    for (const { reject, timer } of pending.values()) {
+      clearTimeout(timer);
+      reject(error);
+    }
     pending.clear();
   };
-  child.on("exit", () => rejectAllPending(new Error("codex app-server exited")));
-  child.on("error", (error) => rejectAllPending(error));
+  child.on("exit", () => {
+    exited = true;
+    const detail = stderrTail.trim().slice(-500);
+    rejectAllPending(new Error(`codex app-server exited${detail ? `: ${detail}` : ""}`));
+  });
+  child.on("error", (error) => { exited = true; rejectAllPending(error); });
 
   return {
+    // Only a POSITIVE indication of death counts. `exited` (set by the 'exit'
+    // and 'error' handlers below) is the authoritative signal; the property
+    // checks are a secondary guard for a child that died before those attached.
+    // Both use loose null so that `undefined` — "this object does not report
+    // exitCode", which is true of any stub and of a process that has not been
+    // spawned yet — reads as alive rather than dead. Treating absence of
+    // information as death would recycle a perfectly good pooled session on
+    // every single job, which is the opposite of what this pool is for.
+    isAlive: () => !exited && child.exitCode == null && child.killed !== true,
+    stderrTail: () => stderrTail,
     request(method, params) {
       const id = nextId++;
       return new Promise((resolve, reject) => {
-        pending.set(id, { resolve, reject });
-        child.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
+        // A write to a dead child's stdin throws EPIPE rather than settling the
+        // promise, so the caller would wait on a request that was never sent.
+        if (exited) {
+          reject(new Error("codex app-server is not running"));
+          return;
+        }
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error(`codex app-server did not answer ${method} within ${requestTimeoutMs}ms`));
+        }, requestTimeoutMs);
+        timer.unref?.();
+        pending.set(id, {
+          resolve: (value) => { clearTimeout(timer); resolve(value); },
+          reject: (error) => { clearTimeout(timer); reject(error); },
+          timer,
+        });
+        try {
+          child.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
+        } catch (error) {
+          pending.delete(id);
+          clearTimeout(timer);
+          reject(error);
+        }
       });
     },
+    // These three are fire-and-forget, so an EPIPE against a child that has
+    // already exited is noise, not news — but an UNCAUGHT one still unwinds
+    // whatever called it (an approval reply, mid-turn). Swallow deliberately:
+    // the request path above is where a dead child is reported.
     notify(method, params) {
-      child.stdin.write(`${JSON.stringify({ method, params })}\n`);
+      try { child.stdin.write(`${JSON.stringify({ method, params })}\n`); } catch { /* child gone */ }
     },
     respond(id, result) {
-      child.stdin.write(`${JSON.stringify({ id, result })}\n`);
+      try { child.stdin.write(`${JSON.stringify({ id, result })}\n`); } catch { /* child gone */ }
     },
     respondError(id, message) {
-      child.stdin.write(`${JSON.stringify({ id, error: { code: -32601, message } })}\n`);
+      try { child.stdin.write(`${JSON.stringify({ id, error: { code: -32601, message } })}\n`); } catch { /* child gone */ }
     },
     onMessage(handler) {
       messageHandlers.add(handler);
@@ -820,7 +893,14 @@ export function createCodexAppServerExecutor({ spawnFn = spawn, idleCloseMs = DE
   const ensureSession = async (sessionKey, opts) => {
     const existing = sessions.get(sessionKey);
     const fingerprint = connectionFingerprint(opts);
-    if (existing && existing.fingerprint === fingerprint) return existing;
+    // A matching fingerprint used to be the ONLY condition for reuse, so a
+    // pooled session whose `codex app-server` had died — crashed, OOM-killed,
+    // killed by the user — was handed straight back. Every request against it
+    // then rejects with "codex app-server exited", and because the dead session
+    // stays in the map, the NEXT turn is handed the same corpse: the agent is
+    // wedged until something else happens to evict the key. Liveness is cheap to
+    // check and is the difference between one failed turn and a dead agent.
+    if (existing && existing.fingerprint === fingerprint && existing.rpc.isAlive()) return existing;
     if (existing) closeSession(sessionKey);
 
     const child = spawnFn("codex", ["app-server"], {
@@ -829,23 +909,34 @@ export function createCodexAppServerExecutor({ spawnFn = spawn, idleCloseMs = DE
       stdio: ["pipe", "pipe", "pipe"],
     });
     const rpc = createJsonRpcClient(child);
-    await rpc.request("initialize", { clientInfo: { name: "agensis-agent", version: opts.clientVersion || "unknown" } });
-    rpc.notify("initialized");
+    // The handshake is the only stretch where a spawned child is owned by
+    // NOTHING: it is not in `sessions` yet, so neither closeSession nor shutdown
+    // can reach it. If either request rejects — and now that requests have a
+    // deadline, "the app-server came up wedged" rejects rather than hanging —
+    // an un-killed `codex app-server` is left behind on every attempt, one per
+    // retry, until the machine runs out of processes.
+    try {
+      await rpc.request("initialize", { clientInfo: { name: "agensis-agent", version: opts.clientVersion || "unknown" } });
+      rpc.notify("initialized");
 
-    const config = opts.leanCli && opts.mcp
-      ? { mcp_servers: { agensis: { url: opts.mcp.url, bearer_token_env_var: "AGENSIS_MCP_TOKEN" } } }
-      : undefined;
-    const threadResult = await rpc.request("thread/start", {
-      cwd: opts.cwd,
-      ephemeral: opts.leanCli || undefined,
-      model: opts.model,
-      config,
-      ...mapCodexApproval(opts.permissionMode),
-    });
+      const config = opts.leanCli && opts.mcp
+        ? { mcp_servers: { agensis: { url: opts.mcp.url, bearer_token_env_var: "AGENSIS_MCP_TOKEN" } } }
+        : undefined;
+      const threadResult = await rpc.request("thread/start", {
+        cwd: opts.cwd,
+        ephemeral: opts.leanCli || undefined,
+        model: opts.model,
+        config,
+        ...mapCodexApproval(opts.permissionMode),
+      });
 
-    const session = { child, rpc, threadId: threadResult.thread.id, fingerprint, idleTimer: null };
-    sessions.set(sessionKey, session);
-    return session;
+      const session = { child, rpc, threadId: threadResult.thread.id, fingerprint, idleTimer: null };
+      sessions.set(sessionKey, session);
+      return session;
+    } catch (error) {
+      try { child.kill("SIGTERM"); } catch { /* already gone */ }
+      throw error;
+    }
   };
 
   const run = (opts) => withLock(opts.sessionKey || "default", async () => {

@@ -58,6 +58,15 @@ function isPublicBridgePath(method, pathname) {
 }
 
 function json(res, status, body) {
+  // Never write a second head. Once a response is committed — which for the
+  // streaming chat path happens at sseStart, long before the handler can fail —
+  // writeHead throws ERR_HTTP_HEADERS_SENT, and here that throw would come from
+  // inside an error handler, escape the async request listener, and land as an
+  // unhandled rejection that terminates the daemon.
+  if (res.headersSent || res.writableEnded) {
+    try { res.end(); } catch { /* already finished */ }
+    return;
+  }
   res.writeHead(status, {
     "content-type": "application/json",
     "access-control-allow-origin": "*",
@@ -886,8 +895,23 @@ export async function startCursorBuddyLocalBridge(config, options = {}) {
           usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
         });
       } catch (error) {
-        record("chat_error", { error: String(error?.message || error) });
-        json(res, 500, { error: { message: String(error?.message || error) } });
+        const message = String(error?.message || error);
+        record("chat_error", { error: message });
+        // On a committed SSE stream the client is waiting for chunks, not for a
+        // JSON body it can no longer be sent. streamComplete throws on the most
+        // ORDINARY failure there is — the spawned CLI exiting non-zero (expired
+        // auth, bad model, rate limit) — so this is the path a normal bad day
+        // takes, and it used to end the daemon rather than the request. Report
+        // the error in the stream's own language and close it cleanly.
+        if (res.headersSent) {
+          try {
+            sseSend(res, { error: { message } });
+            sseSend(res, "[DONE]");
+          } catch { /* peer already gone */ }
+          try { res.end(); } catch { /* already finished */ }
+          return;
+        }
+        json(res, 500, { error: { message } });
       }
       return;
     }

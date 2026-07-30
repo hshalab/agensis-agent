@@ -92,6 +92,45 @@ export async function runAgensisDaemon(rawConfig = {}) {
   let socketRegistered = false;
   let registeredConnection = null;
   const activeInference = new Map();
+  let reconnectAttempts = 0;
+
+  // Reconnect pacing.
+  //
+  // This was a flat `setTimeout(connect, 2000)`. Two things were wrong with it,
+  // and the second is the one that hurts:
+  //
+  //  - NO CEILING ON EFFORT. A hub that is down for an hour is dialled 1,800
+  //    times by every daemon, forever, at full rate. Nothing about the 1,800th
+  //    attempt is more likely to succeed than the 10th.
+  //  - NO JITTER. Every daemon attached to a hub loses its socket at the same
+  //    instant — that is what a deploy is — so every daemon then retries in
+  //    lockstep at exactly 2s, 4s, 6s. They arrive as one synchronised wave, on
+  //    a process that is still booting, and a wave that fails stays synchronised
+  //    for the next one. The hub restart that this is supposed to ride out is
+  //    precisely the moment it hits hardest.
+  //
+  // The jitter is ADDITIVE — `base + random(0, base)` — so the delay is never
+  // SHORTER than the 2s this always waited. That direction is deliberate and was
+  // worth a broken test to find: jitter centred on the old value (base/2 +
+  // random) reconnects up to a second EARLY, and a daemon that comes back sooner
+  // than it used to changes the outcome of anything racing the outage. The park/
+  // re-send path is exactly that race — a turn that ends during the gap must be
+  // parked — and tests/daemon-reconnect-result.test.cjs caught it doing the
+  // wrong thing about one run in five.
+  //
+  // Spreading a herd only needs the retries to differ from each other, which
+  // [base, 2*base) does just as well as [base/2, base). Nothing needs them to be
+  // faster, so nothing here is.
+  //
+  // The ladder doubles to a 30s base, i.e. a 30-60s delay once a hub has been
+  // unreachable for a few minutes.
+  const RECONNECT_BASE_MS = 2_000;
+  const RECONNECT_MAX_BASE_MS = 30_000;
+  const nextReconnectDelay = () => {
+    const base = Math.min(RECONNECT_BASE_MS * 2 ** reconnectAttempts, RECONNECT_MAX_BASE_MS);
+    reconnectAttempts += 1;
+    return Math.round(base + Math.random() * base);
+  };
 
   // Interactive tool approvals. The send closure reads the LIVE `ws` rather than
   // capturing one, because a reconnect swaps the socket underneath every parked
@@ -107,8 +146,10 @@ export async function runAgensisDaemon(rawConfig = {}) {
   // Matched to the hub's own reconnect grace (JOB_RECONNECT_GRACE_MS, 45s): past
   // that point the server has expired the request and failed the job anyway, so
   // holding the turn open for the remaining minutes of the request's TTL just
-  // makes the agent look hung. We reconnect every 2s, so this only ever fires
-  // when the daemon is genuinely cut off.
+  // makes the agent look hung. The first reconnect is attempted inside 2s and
+  // the backoff only stretches out after repeated failures (nextReconnectDelay
+  // below), so this still only fires when the daemon is genuinely cut off —
+  // which is the same window in which the hub has given up on the request too.
   const PERMISSION_RECONNECT_GRACE_MS = 45_000;
   let permissionReconnectTimer = null;
 
@@ -187,10 +228,22 @@ export async function runAgensisDaemon(rawConfig = {}) {
       void pushCapabilitiesSnapshot(ws, config, currentReach());
     });
     lanServer.on("connection", (socket) => {
+      // FIRST listener, before anything can throw. `ws` attaches NO 'error'
+      // listener to the sockets it hands to 'connection' (verified: 0 listeners),
+      // and an EventEmitter 'error' with no listener throws — so a peer that
+      // resets the connection, half-closes, or sends a malformed frame takes the
+      // WHOLE DAEMON down with an uncaught exception, killing every job it is
+      // running for every other caller. The hub guards its own accept path for
+      // exactly this reason (server/realtime.cjs, "an EventEmitter 'error' with
+      // no listener throws"); this listener is the same guard on this side.
+      socket.on("error", (error) => log(`Peer socket error: ${error?.message || error}`));
       let authed = false;
       const authTimer = setTimeout(() => {
         if (!authed) { try { socket.close(1008, "peer auth required"); } catch { /* already closing */ } }
       }, 5000);
+      // A peer that connects and never speaks leaves this timer armed; clearing
+      // it on close keeps a churn of dead peers from piling up pending timers.
+      socket.on("close", () => clearTimeout(authTimer));
       socket.once("message", (raw) => {
         clearTimeout(authTimer);
         const frame = parseMessage(raw);
@@ -365,6 +418,11 @@ export async function runAgensisDaemon(rawConfig = {}) {
     lastSocketErrorCode = '';
     log(`Connecting to ${url.replace(config.token, "redacted")}`);
     ws = new WebSocket(url);
+    // The socket THIS invocation of connect() owns. Every handler below compares
+    // against it before touching shared daemon state, because `ws` is reassigned
+    // by the next connect() and an old socket's late callback must not act on the
+    // new one's behalf.
+    const socket = ws;
 
     ws.on("open", async () => {
       socketRegistered = false;
@@ -380,6 +438,16 @@ export async function runAgensisDaemon(rawConfig = {}) {
       // `name` for existing agents, and lets a human's explicit choice win — so
       // declaring on every connect is safe by design.
       const identity = await readAgentIdentity(config);
+      // readAgentIdentity is disk I/O, so the socket can die across that await —
+      // and 'close' will already have run by the time we resume. Without this
+      // check we would register a dead socket and, worse, install a SECOND
+      // heartbeat interval below: 'close' cleared the timer that existed when it
+      // ran, then this assignment overwrites `heartbeatTimer` with a new one, so
+      // the previous interval is orphaned with no reference left to clear it. It
+      // does not stop beating either — `send` reads the LIVE `ws`, so every
+      // orphan keeps heartbeating down whatever socket is current, one extra
+      // beat per blip, forever.
+      if (socket !== ws || socket.readyState !== WebSocket.OPEN) return;
       send(ws, {
         action: "agent_register",
         workspaceId: config.workspace,
@@ -405,6 +473,9 @@ export async function runAgensisDaemon(rawConfig = {}) {
           version: AGENSIS_CLI_VERSION,
         },
       });
+      // Belt and braces with the guard above: never let an assignment here drop
+      // a live interval on the floor, whatever path got us to this line.
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
       heartbeatTimer = setInterval(() => {
         // Carry the current capability/memory drift hashes alongside the liveness
         // beat. They ride as distinct top-level fields (NOT inside metadata, which the
@@ -442,6 +513,11 @@ export async function runAgensisDaemon(rawConfig = {}) {
       if (!message) return;
       if (message.type === "agent_registered") {
         socketRegistered = true;
+        // A round trip completed, so this is a working connection rather than a
+        // lucky TCP accept. Only here is the backoff allowed back to its floor —
+        // resetting on 'open' would treat a hub that accepts and immediately
+        // rejects as success and turn the backoff into a 2s loop again.
+        reconnectAttempts = 0;
         registeredConnection = message.connection || message.agent || null;
         applyAgentConfig(config, message.agent);
         // Before anything else on a reconnect: hand back any turn that finished
@@ -582,6 +658,18 @@ export async function runAgensisDaemon(rawConfig = {}) {
       if (message.type === "peer_ticket_grant") {
         // The hub pushed us a grant because some peer A wants to reach us directly —
         // hold it until A's socket presents the matching ticket as its first frame.
+        //
+        // Sweep expired grants on the way in. The only delete was the single-use
+        // one on a SUCCESSFUL peer_auth, so every grant for a handoff that was
+        // never made — the peer picked the hub relay instead, or died before
+        // dialling — stayed resident for the life of the daemon. The auth path
+        // already refuses anything past `exp`, so an expired grant is dead weight
+        // by definition; sweeping here keeps the cost on the path that creates it
+        // rather than adding a timer.
+        const now = Date.now();
+        for (const [ticket, grant] of peerGrants) {
+          if (now > grant.exp) peerGrants.delete(ticket);
+        }
         peerGrants.set(message.ticket, { fromAgentId: message.fromAgentId, exp: message.exp });
         return;
       }
@@ -663,7 +751,7 @@ export async function runAgensisDaemon(rawConfig = {}) {
         stop();
       }
       if (stopped || config.once) return;
-      reconnectTimer = setTimeout(connect, 2000);
+      reconnectTimer = setTimeout(connect, nextReconnectDelay());
       if (reconnectTimer.unref) reconnectTimer.unref();
     });
 
@@ -1196,8 +1284,14 @@ async function runAgentJob(config, job, { signal, requestPermission = null }) {
     // because a leaked claim costs slot PREFERENCE and never capacity; see
     // sessionSlots.mjs.)
     slots.release(silo, slot);
+    // The progress timer belongs in here for exactly the same reason. It used to
+    // be cleared on the line AFTER this block, which is only reached when the
+    // turn succeeds — so every turn that threw left a 1s interval running for
+    // the life of the daemon, still calling sendDelta and still pushing progress
+    // frames for a job that had already failed. `unref` keeps it from holding
+    // the process open; it does not stop it beating, and one leaks per failure.
+    clearInterval(progressTimer);
   }
-  clearInterval(progressTimer);
 
   if (parser) {
     parser.end();
@@ -1340,26 +1434,33 @@ async function runAmpAgentJob(config, job, { signal, started = Date.now() } = {}
   let lastDeltaAt = 0;
   const progressTimer = setInterval(() => sendDelta(fullContent), 1000);
   if (progressTimer.unref) progressTimer.unref();
-  const result = await runCli({
-    cmd: command.cmd,
-    args: command.args,
-    cwd,
-    timeoutMs: config.timeoutMs,
-    heartbeatMs: config.heartbeatMs,
-    label: "Amp orb turn",
-    signal,
-    onData: (chunk) => {
-      parser.feed(chunk);
-      tracker.feed(chunk);
-      fullContent = parser.live;
-      const now = Date.now();
-      if (now - lastDeltaAt > 150) {
-        lastDeltaAt = now;
-        sendDelta(fullContent);
-      }
-    },
-  });
-  clearInterval(progressTimer);
+  // try/finally for the same reason as the Claude/Codex turn above: a rejected
+  // runCli left this 1s interval beating for the life of the daemon, pushing
+  // progress frames for a turn that had already failed.
+  let result;
+  try {
+    result = await runCli({
+      cmd: command.cmd,
+      args: command.args,
+      cwd,
+      timeoutMs: config.timeoutMs,
+      heartbeatMs: config.heartbeatMs,
+      label: "Amp orb turn",
+      signal,
+      onData: (chunk) => {
+        parser.feed(chunk);
+        tracker.feed(chunk);
+        fullContent = parser.live;
+        const now = Date.now();
+        if (now - lastDeltaAt > 150) {
+          lastDeltaAt = now;
+          sendDelta(fullContent);
+        }
+      },
+    });
+  } finally {
+    clearInterval(progressTimer);
+  }
   parser.end();
   tracker.end();
   fullContent = parser.live;

@@ -13,6 +13,26 @@ import {
 import { claimCursorBuddyConnectionKey } from "../src/cursorbuddyConnect.mjs";
 import { runSetupFlow } from "../src/setupFlow.mjs";
 
+// Last-resort process guards, mirroring the ones the hub installs in
+// server/index.cjs.
+//
+// This daemon is a long-running supervisor of other people's work: it holds the
+// hub socket, a job queue, parked permission requests and live CLI subprocesses.
+// Until now a single unhandled rejection anywhere in it — a detached promise in
+// a bridge, an HTTP response that could not be written, a peer socket erroring
+// with no listener — took the WHOLE process down under Node's default
+// `--unhandled-rejections=throw`, losing every in-flight turn along with it.
+// Nothing in the tree installed a handler (verified by grep across the repo).
+//
+// Log and stay up: every job path already reports its own failure to the hub, so
+// the correct blast radius for a stray rejection is one turn, not the daemon.
+process.on("unhandledRejection", (reason) => {
+  console.error(`[agensis] unhandled rejection: ${reason?.stack || reason?.message || reason}`);
+});
+process.on("uncaughtException", (error) => {
+  console.error(`[agensis] uncaught exception: ${error?.stack || error?.message || error}`);
+});
+
 function parseArgs(argv) {
   const args = { command: "connect" };
   const rest = [...argv];
