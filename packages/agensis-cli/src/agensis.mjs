@@ -507,6 +507,9 @@ export async function runAgensisDaemon(rawConfig = {}) {
           model: config.model,
           permissionMode: config.permissionMode,
           permissionFlags: permissionFlagsForMode(config.permissionMode),
+          // Two-phase permission decisions: the hub must see this before it may
+          // prepare a decision, wait for our receipt, and then commit it.
+          permissionDecisionReceipts: true,
           once: config.once,
           runtime: "agensis",
           executionRuntime: config.runtime,
@@ -632,6 +635,23 @@ export async function runAgensisDaemon(rawConfig = {}) {
       }
       if (message.type === "agent_permission_decision") {
         permissions.decide(message);
+        return;
+      }
+      if (message.type === "agent_permission_prepare") {
+        permissions.prepare(message, (frame) => {
+          // Receipt the decision on the exact socket that delivered it. An old
+          // socket's late frame must not be acknowledged on its replacement.
+          if (socket !== ws) return false;
+          try {
+            return send(socket, frame);
+          } catch {
+            return false;
+          }
+        });
+        return;
+      }
+      if (message.type === "agent_permission_commit") {
+        permissions.commit(message);
         return;
       }
       if (message.type === "agent_inference_request" && message.requestId) {

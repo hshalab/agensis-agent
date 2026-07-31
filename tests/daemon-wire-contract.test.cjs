@@ -50,6 +50,7 @@ test('daemon honors the hub auth, register, job, delta, and result contract', { 
             assert.equal(frame.agentId, 'agent-wire');
             assert.equal(frame.metadata.runtime, 'agensis');
             assert.equal(frame.metadata.executionRuntime, 'custom');
+            assert.equal(frame.metadata.permissionDecisionReceipts, true);
             assert.deepEqual(frame.identity, {
               avatar: 'FX',
               description: 'Wire contract test agent',
@@ -115,6 +116,149 @@ test('daemon honors the hub auth, register, job, delta, and result contract', { 
     assert.equal(exitCode, 0);
   } finally {
     if (child?.exitCode == null) child?.kill('SIGTERM');
+    await new Promise((resolve) => server.close(resolve));
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('daemon receipts a prepared permission before commit releases the tool', { timeout: 20_000 }, async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agensis-permission-wire-'));
+  const fakeCodex = path.join(tempDir, 'codex');
+  const approvalMarker = path.join(tempDir, 'approval-response.json');
+  await fs.writeFile(fakeCodex, `#!/usr/bin/env node
+import fs from 'node:fs/promises';
+import readline from 'node:readline';
+const marker = process.env.AGENSIS_TEST_APPROVAL_MARKER;
+const threadId = 'thread-wire';
+const turnId = 'turn-wire';
+const send = (frame) => process.stdout.write(JSON.stringify(frame) + '\\n');
+readline.createInterface({ input: process.stdin }).on('line', async (line) => {
+  const message = JSON.parse(line);
+  if (message.method === 'initialize') {
+    send({ id: message.id, result: { codexHome: '/tmp' } });
+  } else if (message.method === 'thread/start') {
+    send({ id: message.id, result: { thread: { id: threadId } } });
+  } else if (message.method === 'turn/start') {
+    send({ id: message.id, result: { turn: { id: turnId, status: 'inProgress' } } });
+    send({ method: 'turn/started', params: { threadId, turn: { id: turnId } } });
+    send({
+      id: 'approval-wire',
+      method: 'item/commandExecution/requestApproval',
+      params: {
+        threadId,
+        turnId,
+        itemId: 'item-wire',
+        command: ['git', 'status'],
+        reason: 'wire receipt test',
+        availableDecisions: ['accept', 'acceptForSession', 'decline'],
+      },
+    });
+  } else if (message.id === 'approval-wire' && message.result) {
+    await fs.writeFile(marker, JSON.stringify(message));
+    send({ method: 'item/completed', params: { threadId, turnId, item: { type: 'agentMessage', id: 'answer-wire', text: 'permission-wire-ok' } } });
+    send({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'completed' } } });
+  }
+});
+`, { mode: 0o700 });
+
+  const server = new WebSocket.Server({ host: '::1', port: 0 });
+  await new Promise((resolve, reject) => {
+    server.once('listening', resolve);
+    server.once('error', reject);
+  });
+  const port = server.address().port;
+  const frames = [];
+  let daemonSocket;
+  let child;
+  let preparedRequestId = '';
+  let resolveReceipt;
+  let rejectReceipt;
+  let resolveResult;
+  let rejectResult;
+  const receiptFrame = new Promise((resolve, reject) => { resolveReceipt = resolve; rejectReceipt = reject; });
+  const resultFrame = new Promise((resolve, reject) => { resolveResult = resolve; rejectResult = reject; });
+
+  try {
+    server.once('connection', (socket) => {
+      daemonSocket = socket;
+      socket.on('message', (raw) => {
+        const frame = JSON.parse(String(raw));
+        frames.push(frame);
+        if (frame.action === 'agent_register') {
+          assert.equal(frame.metadata.permissionDecisionReceipts, true);
+          socket.send(JSON.stringify({ type: 'agent_registered', connection: { name: 'permission-agent', host: 'test-host' } }));
+          socket.send(JSON.stringify({
+            type: 'agent_job',
+            job: {
+              id: 'job-permission-wire',
+              workspaceId: 'workspace-permission-wire',
+              sessionId: 'session-permission-wire',
+              prompt: 'Run git status.',
+              agent: { model: 'gpt-5.4', permission_mode: 'default', run_mode: 'daemon' },
+            },
+          }));
+        } else if (frame.action === 'agent_permission_request') {
+          preparedRequestId = frame.requestId;
+          socket.send(JSON.stringify({
+            type: 'agent_permission_prepare',
+            requestId: frame.requestId,
+            behavior: 'allow',
+            scope: 'once',
+            decidedBy: 'wire-user',
+            message: '',
+          }));
+        } else if (frame.action === 'agent_permission_prepared') {
+          resolveReceipt(frame);
+        } else if (frame.action === 'agent_job_result') {
+          resolveResult(frame);
+        }
+      });
+      socket.once('error', (error) => { rejectReceipt(error); rejectResult(error); });
+    });
+
+    child = spawn(process.execPath, [
+      'packages/agensis-cli/bin/agensis.mjs',
+      'connect',
+      '--url', `http://[::1]:${port}`,
+      '--token', 'aga_permission_wire_token',
+      '--workspace', 'workspace-permission-wire',
+      '--agent', 'agent-permission-wire',
+      '--handle', 'permission-agent',
+      '--cwd', tempDir,
+      '--coding-cmd', 'codex',
+      '--heartbeat-ms', '1000',
+      '--once',
+    ], {
+      cwd: path.resolve(__dirname, '..'),
+      env: {
+        ...process.env,
+        HOME: tempDir,
+        PATH: `${tempDir}${path.delimiter}${process.env.PATH || ''}`,
+        AGENSIS_TEST_APPROVAL_MARKER: approvalMarker,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const receipt = await receiptFrame;
+    assert.deepEqual(receipt, {
+      action: 'agent_permission_prepared',
+      requestId: preparedRequestId,
+      accepted: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(frames.some((frame) => frame.action === 'agent_job_result'), false, 'prepare alone must not release the tool');
+    await assert.rejects(fs.access(approvalMarker), { code: 'ENOENT' });
+
+    daemonSocket.send(JSON.stringify({ type: 'agent_permission_commit', requestId: preparedRequestId }));
+    const result = await resultFrame;
+    assert.equal(result.jobId, 'job-permission-wire');
+    assert.equal(result.response, 'permission-wire-ok');
+    assert.deepEqual(JSON.parse(await fs.readFile(approvalMarker, 'utf8')), {
+      id: 'approval-wire',
+      result: { decision: 'accept' },
+    });
+  } finally {
+    if (child?.exitCode == null) child.kill('SIGTERM');
     await new Promise((resolve) => server.close(resolve));
     await fs.rm(tempDir, { recursive: true, force: true });
   }
