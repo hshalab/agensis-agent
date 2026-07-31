@@ -45,6 +45,27 @@ agensis connect --url ... --token ... --workspace ... --agent ...
 The command stays connected, sends heartbeats, accepts queued jobs, and exits on
 Ctrl+C.
 
+## Keep the agent running
+
+After a successful connection saves the local profile, install it as a per-user
+background service:
+
+```sh
+agensis service install --profile default
+agensis service status --profile default
+agensis service logs --profile default
+```
+
+This installs a macOS LaunchAgent (`RunAtLoad` + `KeepAlive`) or Linux systemd
+user unit (`Restart=always`) around `agensis supervise`, so the agent survives
+terminal and desktop-app exits. The service definition contains no connection
+token or workspace data; it references only the profile name, executable paths,
+and log paths. The token stays in the existing mode-0600 daemon profile.
+
+`agensis service logs --profile default --follow` explicitly follows the two
+logs. `agensis service uninstall --profile default` disables and removes only
+that profile's service. Windows service installation is not yet supported.
+
 ## Options
 
 Required:
@@ -69,6 +90,7 @@ Optional:
 - `--timeout-ms <ms>` — kill a job after this time (default `1800000`)
 - `--heartbeat-ms <ms>` — heartbeat interval (default `15000`)
 - `--once` — run one queued job then exit
+- `--profile <name>` — select a saved profile for connect, supervise, or service commands
 - `--version` — print the CLI version
 - `--help` — show help
 
