@@ -121,14 +121,16 @@ test('daemon honors the hub auth, register, job, delta, and result contract', { 
   }
 });
 
-test('daemon receipts a prepared permission before commit releases the tool', { timeout: 20_000 }, async () => {
+test('daemon receipts prepared permissions before commit or abort releases the tool', { timeout: 20_000 }, async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agensis-permission-wire-'));
   const fakeCodex = path.join(tempDir, 'codex');
   const approvalMarker = path.join(tempDir, 'approval-response.json');
+  const abortedApprovalMarker = path.join(tempDir, 'aborted-approval-response.json');
   await fs.writeFile(fakeCodex, `#!/usr/bin/env node
 import fs from 'node:fs/promises';
 import readline from 'node:readline';
 const marker = process.env.AGENSIS_TEST_APPROVAL_MARKER;
+const abortedMarker = process.env.AGENSIS_TEST_ABORTED_APPROVAL_MARKER;
 const threadId = 'thread-wire';
 const turnId = 'turn-wire';
 const send = (frame) => process.stdout.write(JSON.stringify(frame) + '\\n');
@@ -155,6 +157,20 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
     });
   } else if (message.id === 'approval-wire' && message.result) {
     await fs.writeFile(marker, JSON.stringify(message));
+    send({
+      id: 'approval-wire-abort',
+      method: 'item/commandExecution/requestApproval',
+      params: {
+        threadId,
+        turnId,
+        itemId: 'item-wire-abort',
+        command: ['git', 'diff'],
+        reason: 'wire abort test',
+        availableDecisions: ['accept', 'acceptForSession', 'decline'],
+      },
+    });
+  } else if (message.id === 'approval-wire-abort' && message.result) {
+    await fs.writeFile(abortedMarker, JSON.stringify(message));
     send({ method: 'item/completed', params: { threadId, turnId, item: { type: 'agentMessage', id: 'answer-wire', text: 'permission-wire-ok' } } });
     send({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'completed' } } });
   }
@@ -170,12 +186,15 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
   const frames = [];
   let daemonSocket;
   let child;
-  let preparedRequestId = '';
-  let resolveReceipt;
-  let rejectReceipt;
+  const preparedRequestIds = [];
+  let resolveCommitReceipt;
+  let rejectCommitReceipt;
+  let resolveAbortReceipt;
+  let rejectAbortReceipt;
   let resolveResult;
   let rejectResult;
-  const receiptFrame = new Promise((resolve, reject) => { resolveReceipt = resolve; rejectReceipt = reject; });
+  const commitReceiptFrame = new Promise((resolve, reject) => { resolveCommitReceipt = resolve; rejectCommitReceipt = reject; });
+  const abortReceiptFrame = new Promise((resolve, reject) => { resolveAbortReceipt = resolve; rejectAbortReceipt = reject; });
   const resultFrame = new Promise((resolve, reject) => { resolveResult = resolve; rejectResult = reject; });
 
   try {
@@ -198,7 +217,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
             },
           }));
         } else if (frame.action === 'agent_permission_request') {
-          preparedRequestId = frame.requestId;
+          preparedRequestIds.push(frame.requestId);
           socket.send(JSON.stringify({
             type: 'agent_permission_prepare',
             requestId: frame.requestId,
@@ -208,12 +227,17 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
             message: '',
           }));
         } else if (frame.action === 'agent_permission_prepared') {
-          resolveReceipt(frame);
+          if (frame.requestId === preparedRequestIds[0]) resolveCommitReceipt(frame);
+          else resolveAbortReceipt(frame);
         } else if (frame.action === 'agent_job_result') {
           resolveResult(frame);
         }
       });
-      socket.once('error', (error) => { rejectReceipt(error); rejectResult(error); });
+      socket.once('error', (error) => {
+        rejectCommitReceipt(error);
+        rejectAbortReceipt(error);
+        rejectResult(error);
+      });
     });
 
     child = spawn(process.execPath, [
@@ -235,27 +259,48 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
         HOME: tempDir,
         PATH: `${tempDir}${path.delimiter}${process.env.PATH || ''}`,
         AGENSIS_TEST_APPROVAL_MARKER: approvalMarker,
+        AGENSIS_TEST_ABORTED_APPROVAL_MARKER: abortedApprovalMarker,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    const receipt = await receiptFrame;
-    assert.deepEqual(receipt, {
+    const commitReceipt = await commitReceiptFrame;
+    assert.deepEqual(commitReceipt, {
       action: 'agent_permission_prepared',
-      requestId: preparedRequestId,
+      requestId: preparedRequestIds[0],
       accepted: true,
     });
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(frames.some((frame) => frame.action === 'agent_job_result'), false, 'prepare alone must not release the tool');
     await assert.rejects(fs.access(approvalMarker), { code: 'ENOENT' });
 
-    daemonSocket.send(JSON.stringify({ type: 'agent_permission_commit', requestId: preparedRequestId }));
+    daemonSocket.send(JSON.stringify({ type: 'agent_permission_commit', requestId: preparedRequestIds[0] }));
+
+    const abortReceipt = await abortReceiptFrame;
+    assert.deepEqual(abortReceipt, {
+      action: 'agent_permission_prepared',
+      requestId: preparedRequestIds[1],
+      accepted: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(frames.some((frame) => frame.action === 'agent_job_result'), false, 'prepare alone must remain parked before abort');
+    await assert.rejects(fs.access(abortedApprovalMarker), { code: 'ENOENT' });
+
+    daemonSocket.send(JSON.stringify({
+      type: 'agent_permission_abort',
+      requestId: preparedRequestIds[1],
+      message: 'The app cleared this request.',
+    }));
     const result = await resultFrame;
     assert.equal(result.jobId, 'job-permission-wire');
     assert.equal(result.response, 'permission-wire-ok');
     assert.deepEqual(JSON.parse(await fs.readFile(approvalMarker, 'utf8')), {
       id: 'approval-wire',
       result: { decision: 'accept' },
+    });
+    assert.deepEqual(JSON.parse(await fs.readFile(abortedApprovalMarker, 'utf8')), {
+      id: 'approval-wire-abort',
+      result: { decision: 'decline' },
     });
   } finally {
     if (child?.exitCode == null) child.kill('SIGTERM');

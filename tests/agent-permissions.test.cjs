@@ -263,6 +263,30 @@ test('a failed prepare receipt remains parked until the same decision is receipt
   assert.deepEqual(await pending, { behavior: 'deny', message: 'Not this time.' });
 });
 
+test('abort denies ordinary and prepared requests exactly once', async () => {
+  const { createPermissionBroker } = await loadPermissions();
+  const broker = createPermissionBroker({
+    send: () => true,
+    idFactory: (() => { let n = 0; return () => `req-${n += 1}`; })(),
+  });
+  const ordinary = broker.request({ jobId: 'job-1', toolName: 'Bash' });
+  const prepared = broker.request({ jobId: 'job-2', toolName: 'Edit' });
+
+  assert.equal(broker.prepare({ requestId: 'req-2', behavior: 'allow', scope: 'once' }, () => true), true);
+  assert.equal(broker.abort({ requestId: 'req-1', message: 'The app cleared this request.' }), true);
+  assert.equal(broker.abort({ requestId: 'req-2' }), true, 'a prepared request must still be abortable');
+  assert.equal(broker.abort({ requestId: 'req-2' }), false, 'duplicate abort is ignored');
+  assert.equal(broker.commit({ requestId: 'req-2' }), false, 'commit after abort cannot execute the tool');
+  assert.equal(broker.abort({ requestId: 'missing' }), false);
+
+  assert.deepEqual(await ordinary, { behavior: 'deny', message: 'The app cleared this request.' });
+  assert.deepEqual(await prepared, {
+    behavior: 'deny',
+    message: 'This permission request was cancelled.',
+  });
+  assert.equal(broker.pendingCount(), 0);
+});
+
 test('a request with no rule to store offers only once and session', async () => {
   const { createPermissionBroker } = await loadPermissions();
   const sent = [];

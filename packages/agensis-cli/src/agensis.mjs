@@ -654,6 +654,10 @@ export async function runAgensisDaemon(rawConfig = {}) {
         permissions.commit(message);
         return;
       }
+      if (message.type === "agent_permission_abort") {
+        permissions.abort(message);
+        return;
+      }
       if (message.type === "agent_inference_request" && message.requestId) {
         const requestId = String(message.requestId);
         const selected = config.sharedModels.find((model) => model.id === message.model);

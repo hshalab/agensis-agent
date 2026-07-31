@@ -370,6 +370,22 @@ export function createPermissionBroker({
     },
 
     /**
+     * Apply an explicit server abort to any parked request, prepared or not.
+     *
+     * The legacy decision lane deliberately cannot touch prepared entries, so
+     * clear/cancel needs its own terminal frame. settle() deletes first, making
+     * duplicate aborts and any later commit harmless no-ops.
+     */
+    abort(message) {
+      const requestId = String(message?.requestId || "");
+      if (!requestId || !pending.has(requestId)) return false;
+      const reason = String(message?.message || message?.reason || "").trim()
+        || "This permission request was cancelled.";
+      log(`permission request aborted for ${requestId}`);
+      return settle(requestId, denial(reason));
+    },
+
+    /**
      * The request ids this process is still parked on.
      *
      * Sent on every register. A socket drop does NOT end the turn — the CLI
