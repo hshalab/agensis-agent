@@ -1,8 +1,8 @@
 {
   "name": "agensis-cli",
-  "version": "0.1.46",
+  "version": "0.1.47",
   "private": true,
-  "description": "Run a local agensis workspace agent daemon. It connects to a workspace, receives @mention jobs, runs a configured coding CLI in the local folder, and posts results back to agensis.",
+  "description": "Relay host source for agensis workspace agents. Connects to a workspace, receives @mention jobs, runs a coding CLI, posts results back (same path as desktop ACP).",
   "homepage": "https://agensis.io",
   "repository": {
     "type": "git",

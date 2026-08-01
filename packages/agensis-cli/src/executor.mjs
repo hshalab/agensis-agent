@@ -142,7 +142,7 @@ function createE2bProviderLazy(opts) {
       // are only warnings, so e2b can install on Node 18 and then fail cryptically
       // at import — check the runtime version FIRST and fail with a clear message.
       if (!nodeSupportsE2b()) {
-        throw new Error(`Sandbox execution requires Node >=20.18.1 (you have ${process.versions.node}). Upgrade Node to use Sandbox agents; Built-in and Remote daemon modes still work on Node 18.`);
+        throw new Error(`Sandbox execution requires Node >=20.18.1 (you have ${process.versions.node}). Upgrade Node to use Sandbox agents; Direct and Relay modes still work on Node 18.`);
       }
       // The Node-version check above fails fast on an unsupported runtime. The
       // adapter module itself has no top-level e2b import (e2b loads lazily inside

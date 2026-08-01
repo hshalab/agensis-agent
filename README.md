@@ -1,12 +1,21 @@
 # Agensis Agent
 
-Open-source local daemon for connecting Claude Code, Codex, and other coding
-CLIs to an [Agensis](https://agensis.io) workspace.
+Open-source **Relay host** for [Agensis](https://agensis.io) workspace agents —
+connect Claude Code, Codex, Hermes, Grok, and other coding CLIs on a machine
+that should execute work.
 
-The daemon receives workspace jobs over an authenticated WebSocket, runs the
+In the product, agent run modes are:
+
+| Mode | Meaning |
+|------|---------|
+| **Direct** | Runs on agensis (hosted). No this package. |
+| **Relay** | Jobs pushed to a linked host — this CLI **or** desktop ACP. |
+| **Connector** | External MCP client acts as the agent. |
+
+The daemon receives Relay jobs over an authenticated WebSocket, runs the
 selected coding CLI in the configured working directory, and streams results
-back to Agensis. The website, backend, and desktop application remain in a
-separate private repository; this repository contains only the host-side agent.
+back to Agensis (web and desktop). The website, backend, and desktop app live
+in a separate repository; this repo is only the host-side Relay client.
 
 Amp Orb agents use the same connection: the daemon invokes the signed-in local
 Amp CLI to create or continue an Amp-managed orb thread, then streams that

@@ -1,10 +1,15 @@
 # @agensis/agensis-agent
 
-Run a local [agensis](https://agensis.io) workspace agent daemon from your machine.
+**Relay host** for [agensis](https://agensis.io) workspace agents — run jobs on
+this machine (desktop ACP uses the same Relay path from the app).
 
 It connects to an agensis workspace over WebSocket, receives `@mention` jobs,
-runs your configured coding CLI in the local folder, and posts results back to
-the workspace. The installed command is `agensis`.
+runs your configured coding CLI in the local folder, and posts results back so
+web and desktop both see the agent online. The installed command is `agensis`.
+
+In the Agents UI, set the agent to **Relay** (not Direct). Direct runs on
+agensis servers; this package only serves Relay agents. **Connector** is MCP
+and is a separate attach path.
 
 ## Install
 
@@ -18,10 +23,10 @@ Or run without installing:
 npx @agensis/agensis-agent agensis --help
 ```
 
-## Connect an agent
+## Connect a Relay agent
 
-In agensis, open the agent profile, choose **Connect**, and copy the generated
-command. It looks like:
+In agensis, open the agent profile (run mode **Relay**), choose **Connect**,
+and copy the generated command. It looks like:
 
 ```sh
 agensis connect \

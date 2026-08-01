@@ -1,7 +1,7 @@
 {
   "name": "@agensis/agensis-agent",
-  "version": "0.1.46",
-  "description": "Run a local agensis workspace agent daemon. Connects to a workspace, receives @mention jobs, runs a configured coding CLI in the local folder, and posts results back to agensis. Ships as a single minified bundle.",
+  "version": "0.1.47",
+  "description": "Relay host for agensis workspace agents. Connects to a workspace, receives @mention jobs on a linked machine (CLI or same path as desktop ACP), runs a coding CLI, and posts results back. Ships as a single minified bundle.",
   "homepage": "https://agensis.io",
   "repository": {
     "type": "git",
