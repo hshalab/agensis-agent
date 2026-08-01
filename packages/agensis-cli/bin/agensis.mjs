@@ -77,6 +77,10 @@ function parseArgs(argv) {
       args.noCoding = true;
       continue;
     }
+    if (key === "noAcp") {
+      args.noAcp = true;
+      continue;
+    }
     if (key === "fullCliContext") {
       args.fullCliContext = true;
       continue;
@@ -149,6 +153,10 @@ Options:
   --name <name>           Display name
   --cwd <path>            Folder where the coding CLI runs
   --runtime <runtime>     Executor runtime: claude, codex, or amp
+  --acp-harness <id>      Prefer this ACP harness when available (claude, codex,
+                          hermes, grok, goose, …). Default: from agent metadata
+                          or --runtime / coding family
+  --no-acp                Disable ACP; always use classic CLI/SDK execution
   --host-folder <path>    Extra folder the coding CLI may read/write (repeatable; passed as --add-dir)
   --coding-cmd <command>  Command used for jobs, default: claude -p
   --amp-cmd <path>        Amp CLI executable, default: amp

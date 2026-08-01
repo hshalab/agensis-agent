@@ -1,7 +1,7 @@
 {
   "name": "@agensis/agensis-agent",
-  "version": "0.1.47",
-  "description": "Relay host for agensis workspace agents. Connects to a workspace, receives @mention jobs on a linked machine (CLI or same path as desktop ACP), runs a coding CLI, and posts results back. Ships as a single minified bundle.",
+  "version": "0.1.48",
+  "description": "Relay host for agensis workspace agents. Prefers ACP harnesses when installed (same adapters as desktop); falls back to classic coding CLIs. Ships as a single minified bundle.",
   "homepage": "https://agensis.io",
   "repository": {
     "type": "git",

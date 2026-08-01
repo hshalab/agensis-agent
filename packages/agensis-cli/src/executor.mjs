@@ -8,6 +8,7 @@
 // injected provider. createExecutor picks one by run_mode + coding-CLI family.
 import { runCli } from "./cli.mjs";
 import { createClaudeSdkExecutor, createCodexAppServerExecutor } from "./connectionExecutors.mjs";
+import { createPreferAcpExecutor } from "./acp/executor.mjs";
 
 export function createLocalExecutor({ run = runCli } = {}) {
   return { run: (opts) => run(opts) };
@@ -88,14 +89,26 @@ export function createSandboxExecutor(provider) {
   };
 }
 
-export function createExecutor(job, { makeProvider, family } = {}) {
+/**
+ * Pick how a coding job runs on this host.
+ *
+ * Prefer ACP when a harness is installed (claude-agent-acp, codex-acp, hermes, …)
+ * so the Relay CLI can use the same local adapters as desktop. Fall back to:
+ *   - warm SDK / app-server (claude / codex families)
+ *   - classic subprocess (`claude -p` / `codex exec` / custom coding-cmd)
+ *
+ * Disable ACP with --no-acp or AGENSIS_ACP=0.
+ */
+export function createExecutor(job, { makeProvider, family, config } = {}) {
   const runMode = job && job.agent && job.agent.run_mode;
   if (runMode === "sandbox") {
     const factory = makeProvider || defaultSandboxProviderFactory;
     return createSandboxExecutor(factory(job));
   }
-  if (family === "claude" || family === "codex") return createPrimaryExecutor(family);
-  return createLocalExecutor();
+  const classic = (family === "claude" || family === "codex")
+    ? createPrimaryExecutor(family)
+    : createLocalExecutor();
+  return createPreferAcpExecutor({ job, family, config, fallback: classic });
 }
 
 // Default factory: builds a provider from job.agent.sandbox_provider + env secrets.

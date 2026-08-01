@@ -4,9 +4,12 @@
 `@agensis/agensis-agent`). The installed command is `agensis`.
 
 It connects over WebSocket, receives jobs for agents set to **Relay** in the UI,
-runs your coding CLI in the local folder, and posts results back. Same job path
-as desktop ACP. **Direct** agents run on agensis servers (this package is not
-used). **Connector** is MCP.
+and executes them via **ACP when a local harness is available** (same adapters
+desktop uses), otherwise the classic Claude/Codex SDK or subprocess path.
+**Direct** agents run on agensis servers. **Connector** is MCP.
+
+`--no-acp` / `AGENSIS_ACP=0` force classic execution. `--acp-harness <id>` or
+agent `metadata.acp_harness` selects Hermes/Grok/Claude ACP/etc.
 
 This workspace contains the readable source for the published package.
 

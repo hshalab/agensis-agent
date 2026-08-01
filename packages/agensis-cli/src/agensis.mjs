@@ -72,7 +72,7 @@ const DEFAULT_MAX_CONCURRENCY = 2;
 const DEFAULT_SESSION_SLOTS = 1;
 const LEAN_PROMPT_MAX_BYTES = 10 * 1024;
 const DEFAULT_MODEL = "claude-opus-4-8";
-export const AGENSIS_CLI_VERSION = "0.1.47";
+export const AGENSIS_CLI_VERSION = "0.1.48";
 
 export async function runAgensisDaemon(rawConfig = {}) {
   const config = normalizeConfig(rawConfig);
@@ -909,6 +909,13 @@ function normalizeConfig(raw) {
     // process per job (see connectionExecutors.mjs). Falls back to today's
     // subprocess-per-job behavior automatically if that connection isn't
     // available on this host, or always if the operator opts out here.
+    //
+    // ACP (Agent Client Protocol) is preferred when a harness is installed
+    // (claude-agent-acp, codex-acp, hermes, grok, …) so this Relay CLI can use
+    // the same local adapters as desktop. Opt out with --no-acp / AGENSIS_ACP=0.
+    acp: !booleanOption(raw.noAcp, false),
+    noAcp: booleanOption(raw.noAcp, false),
+    acpHarness: String(raw.acpHarness || process.env.AGENSIS_ACP_HARNESS || "").trim().toLowerCase() || "",
     fastConnection: booleanOption(raw.fastConnection, booleanOption(process.env.AGENSIS_FAST_CONNECTION, true)),
     // Local Claude memory can contain private project notes. Never upload it
     // unless the host operator opted in at daemon launch time.
@@ -1261,7 +1268,7 @@ async function runAgentJob(config, job, { signal, requestPermission = null }) {
   const family = config.fastConnection && usesBareBinary
     ? (isClaudeCommand(command.cmd) ? "claude" : isCodexCommand(command.cmd) ? "codex" : null)
     : null;
-  const executor = createExecutor(job, { family });
+  const executor = createExecutor(job, { family, config });
   // Which warm session this conversation runs on. The SILO (workspace+agent) is
   // what a session is scoped to; the SLOT says which of that silo's sessions.
   // At the default of one slot every lane resolves to slot 0, so the key is

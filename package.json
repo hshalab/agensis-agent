@@ -1,6 +1,6 @@
 {
   "name": "agensis-agent-monorepo",
-  "version": "0.1.47",
+  "version": "0.1.48",
   "private": true,
   "description": "Open-source Relay host (agensis-agent) for Agensis workspace agents",
   "workspaces": [
@@ -8,7 +8,7 @@
   ],
   "scripts": {
     "check": "npm run check --workspace=agensis-cli",
-    "test": "node --experimental-test-module-mocks --test tests/*.test.cjs tests/*.test.mjs",
+    "test": "AGENSIS_ACP=0 node --experimental-test-module-mocks --test tests/*.test.cjs tests/*.test.mjs",
     "test:unit": "vitest run tests/unit",
     "build": "npm run build --workspace=@agensis/agensis-agent",
     "version:check": "node scripts/check-version.mjs",
