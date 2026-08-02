@@ -3,6 +3,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import process from "node:process";
+import { spawn } from "node:child_process";
 import WebSocket from "ws";
 import { createExecutor } from "./executor.mjs";
 import { harnessAvailable } from "./acp/executor.mjs";
@@ -74,7 +75,7 @@ const DEFAULT_MAX_CONCURRENCY = 2;
 const DEFAULT_SESSION_SLOTS = 1;
 const LEAN_PROMPT_MAX_BYTES = 10 * 1024;
 const DEFAULT_MODEL = "claude-opus-4-8";
-export const AGENSIS_CLI_VERSION = "0.1.52";
+export const AGENSIS_CLI_VERSION = "0.1.53";
 
 export async function runAgensisDaemon(rawConfig = {}) {
   const config = normalizeConfig(rawConfig);
@@ -594,6 +595,17 @@ export async function runAgensisDaemon(rawConfig = {}) {
         applyAgentConfig(config, message.agent);
         log(`Updated config for @${config.handle || "agent"}: model=${config.model}, permission=${config.permissionMode}`);
         void writeAgentMirror(config, message.agent).catch(() => { });
+        return;
+      }
+      if (message.type === "agent_restart") {
+        const reason = String(message.reason || "").trim();
+        log(`Restart requested${reason ? `: ${reason}` : ""}`);
+        void restartSelf({
+          ws,
+          queue,
+          log,
+          drainMs: Number(message.drainMs) > 0 ? Number(message.drainMs) : undefined,
+        });
         return;
       }
       if (message.type === "agent_memory_refresh") {
@@ -2453,6 +2465,70 @@ function sendResult(job, frame) {
   if (send(job.ws, frame)) return true;
   job.parkResult?.(frame);
   return false;
+}
+
+/** How long a restart waits for in-flight turns before replacing the process anyway. */
+const RESTART_DRAIN_MS = 60_000;
+
+/**
+ * Re-exec THIS process with the same argv.
+ *
+ * A restart is the only way a running host adopts newly published CLI code: the
+ * module graph is already loaded, so installing a new version changes nothing
+ * until the process itself is replaced. Doing that from a server message means a
+ * human no longer has to go and find the terminal it was launched in — which,
+ * until this existed, was the only way to do it.
+ *
+ * In-flight turns drain first (bounded). Killing mid-turn is exactly the
+ * "agent stopped responding" failure the connection-reliability work removed, and
+ * a restart must not reintroduce it. The socket closes with 1012 (service
+ * restart) for the same reason the drain path does: 1008 stops the whole fleet.
+ *
+ * `detached` + inherited stdio hands the replacement the same terminal, which is
+ * where these actually run. Under `agensis supervise` the spawn is redundant but
+ * harmless — the supervisor respawns its child anyway, so both launch styles end
+ * up in the same place.
+ */
+export async function restartSelf({
+  ws,
+  queue = null,
+  log = () => { },
+  drainMs = RESTART_DRAIN_MS,
+  spawnFn = spawn,
+  exit = (code) => process.exit(code),
+} = {}) {
+  if (queue && typeof queue.active === "function" && queue.active() > 0) {
+    log(`Restart: draining ${queue.active()} in-flight job(s), up to ${Math.round(drainMs / 1000)}s`);
+    await Promise.race([
+      queue.idle(),
+      new Promise((resolve) => {
+        const timer = setTimeout(resolve, drainMs);
+        if (timer.unref) timer.unref();
+      }),
+    ]);
+  }
+  try {
+    ws?.close(1012, "restarting");
+  } catch {
+    // Already gone — the replacement registers a fresh connection regardless.
+  }
+  try {
+    const child = spawnFn(process.execPath, process.argv.slice(1), {
+      detached: true,
+      stdio: "inherit",
+      cwd: process.cwd(),
+      env: process.env,
+    });
+    child?.unref?.();
+  } catch (error) {
+    // Never exit on a failed spawn: a daemon that is merely out of date is far
+    // better than no daemon at all.
+    log(`Restart aborted — could not spawn a replacement: ${error?.message || error}`);
+    return false;
+  }
+  log("Restart: replacement started, exiting");
+  exit(0);
+  return true;
 }
 
 // Does this stream look like the NDJSON `claude -p --output-format stream-json`
