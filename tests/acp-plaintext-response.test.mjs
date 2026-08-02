@@ -117,3 +117,32 @@ test("a classic stream-json run still has its NDJSON parsed, not shipped raw", a
     "raw NDJSON leaked into the response instead of being parsed",
   );
 });
+
+test("a classic turn never streams raw NDJSON into the live view", async () => {
+  // THE 0.1.49 REGRESSION. Skipping the parser whenever ACP was *predicted* meant
+  // that when ACP declined at runtime and the classic CLI ran instead, every
+  // stream-json frame was pushed to the chat verbatim — the user saw
+  // {"type":"stream_event","event":{...}} instead of words. The path that runs is
+  // not knowable up front, so the parser must always exist for a stream-json
+  // command and the raw stream may only surface when it plainly is not NDJSON.
+  const frames = await runWithExecutor(async (opts) => {
+    // Streamed frame by frame, exactly as the classic CLI emits them.
+    opts.onData?.(`${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hey" } } })}\n`);
+    opts.onData?.(`${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: " Jason." } } })}\n`);
+    opts.onData?.(`${JSON.stringify({ type: "result", subtype: "success", result: "Hey Jason." })}\n`);
+    // No `acp` field at all — this is what the classic executor returns.
+    return { status: 0, stdout: "", stderr: "", error: null, stop: "end_turn" };
+  });
+
+  const leaked = frames.filter(
+    (f) => f.action === "agent_job_delta" && /"type"\s*:\s*"(stream_event|result)"/.test(String(f.content || "")),
+  );
+  assert.equal(
+    leaked.length,
+    0,
+    `raw NDJSON reached the chat in ${leaked.length} delta frame(s): ${JSON.stringify(leaked[0]?.content || "").slice(0, 160)}`,
+  );
+
+  const result = frames.find((f) => f.action === "agent_job_result");
+  assert.equal(result.response, "Hey Jason.", "the parsed text is what the turn should answer with");
+});

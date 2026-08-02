@@ -5,7 +5,6 @@ import crypto from "node:crypto";
 import process from "node:process";
 import WebSocket from "ws";
 import { createExecutor } from "./executor.mjs";
-import { willUseAcp } from "./acp/executor.mjs";
 import { runCli } from "./cli.mjs";
 import {
   ampFailureError,
@@ -73,7 +72,7 @@ const DEFAULT_MAX_CONCURRENCY = 2;
 const DEFAULT_SESSION_SLOTS = 1;
 const LEAN_PROMPT_MAX_BYTES = 10 * 1024;
 const DEFAULT_MODEL = "claude-opus-4-8";
-export const AGENSIS_CLI_VERSION = "0.1.49";
+export const AGENSIS_CLI_VERSION = "0.1.50";
 
 export async function runAgensisDaemon(rawConfig = {}) {
   const config = normalizeConfig(rawConfig);
@@ -1268,16 +1267,19 @@ async function runAgentJob(config, job, { signal, requestPermission = null }) {
   const family = config.fastConnection && usesBareBinary
     ? (isClaudeCommand(command.cmd) ? "claude" : isCodexCommand(command.cmd) ? "codex" : null)
     : null;
-  // An ACP run streams and returns PLAIN TEXT. createStreamJsonParser reads the
-  // NDJSON that `claude -p --output-format stream-json` emits. Feed one to the
-  // other and the parser yields nothing at all — which is how a complete answer
-  // reached the server as response:"" and rendered as
-  // "@handle finished without output." So the parser only exists for the path
-  // that actually speaks NDJSON.
-  const acpMode = willUseAcp({ job, family, config });
-  const parser = command.streamJson && !acpMode
+  // ACP streams and returns PLAIN TEXT; createStreamJsonParser reads the NDJSON
+  // that `claude -p --output-format stream-json` emits. Both paths are live at
+  // once and WHICH one runs cannot be known until the executor reports back —
+  // ACP can be declined up front, or bail mid-run and hand the job to the
+  // classic CLI. So the parser is always built for a stream-json command, the
+  // raw stream is kept alongside it, and each is used only for the format it
+  // actually fits. Guessing up front got this wrong in both directions: reading
+  // the parser on an ACP turn produced response:"" ("finished without output"),
+  // and skipping the parser on a classic turn dumped raw NDJSON into the chat.
+  const parser = command.streamJson
     ? createStreamJsonParser({ onStep: sendStep, onSegment: sendSegment })
     : null;
+  let rawContent = "";
   const executor = createExecutor(job, { family, config });
   // Which warm session this conversation runs on. The SILO (workspace+agent) is
   // what a session is scoped to; the SLOT says which of that silo's sessions.
@@ -1317,11 +1319,16 @@ async function runAgentJob(config, job, { signal, requestPermission = null }) {
     // executors keep their pre-broker behaviour: deny rather than self-approve.
     requestPermission,
     onData: (chunk) => {
+      const text = String(chunk || "");
+      rawContent += text;
       if (parser) {
-        parser.feed(chunk);
-        fullContent = parser.live;
+        parser.feed(text);
+        // The parser owns the view the moment it reads anything. Until then the
+        // stream is only shown raw if it plainly is NOT NDJSON — that is the ACP
+        // case. A classic turn must never show its own JSON frames in the chat.
+        fullContent = parser.live || (looksLikeNdjson(rawContent) ? "" : rawContent);
       } else {
-        fullContent += String(chunk || "");
+        fullContent += text;
         latest = latestLine(`${latest}\n${chunk}`);
       }
       const now = Date.now();
@@ -1372,20 +1379,9 @@ async function runAgentJob(config, job, { signal, requestPermission = null }) {
     : result.status === 0
       ? ""
       : stderr || `Command exited with status ${result.status}`;
-  let response;
-  if (parser && !ranAcp) {
-    response = parser.result || (error ? "" : stderr);
-  } else if (!parser && !ranAcp && command.streamJson && stdout) {
-    // ACP was expected but the harness bailed, so the classic CLI ran after all
-    // and its output IS stream-json. Parse it rather than shipping raw NDJSON to
-    // the chat, which is the mirror image of the bug above.
-    const late = createStreamJsonParser({ onStep: () => { }, onSegment: () => { } });
-    late.feed(stdout);
-    late.end();
-    response = late.result || (error ? "" : stderr);
-  } else {
-    response = stdout || (error ? "" : stderr) || latest || "";
-  }
+  const response = parser && !ranAcp
+    ? parser.result || (error ? "" : stderr)
+    : stdout || (error ? "" : stderr) || latest || "";
   // The live view never saw ACP's text (no parser fed it), so land the answer
   // there too rather than leaving the bubble empty until the result frame.
   if (ranAcp && response) sendDelta(response);
@@ -2426,6 +2422,15 @@ function sendResult(job, frame) {
   if (send(job.ws, frame)) return true;
   job.parkResult?.(frame);
   return false;
+}
+
+// Does this stream look like the NDJSON `claude -p --output-format stream-json`
+// emits, rather than the plain text an ACP harness streams? Only the FIRST
+// non-blank character can be trusted here: the check runs mid-stream, on a
+// buffer that may hold half a frame. A classic turn always opens with `{`, so
+// this keeps raw JSON out of the chat while letting ACP text through.
+function looksLikeNdjson(text) {
+  return /^\s*\{/.test(String(text || ""));
 }
 
 function latestLine(text) {
