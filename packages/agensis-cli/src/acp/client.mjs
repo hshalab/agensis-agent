@@ -64,6 +64,8 @@ export function extractTextFromResult(result) {
  *   cwd?: string,
  *   env?: Record<string, string>,
  *   autoApprove?: boolean,
+ *   mcpServers?: Array<object>,
+ *   permissionMode?: string,
  *   onUpdate?: (params: object) => void,
  *   onLog?: (line: string) => void,
  *   clientName?: string,
@@ -76,6 +78,8 @@ export function createAcpClient(options) {
     cwd = process.cwd(),
     env = {},
     autoApprove = true,
+    mcpServers = [],
+    permissionMode = "",
     onUpdate = null,
     onLog = null,
     clientName = "agensis-agent",
@@ -226,12 +230,22 @@ export function createAcpClient(options) {
 
     if (method === "session/request_permission") {
       const optionsList = Array.isArray(params.options) ? params.options : [];
-      const allow = optionsList.find((o) => /allow|accept|yes|approve/i.test(
-        String(o?.optionId || o?.name || o?.kind || ""),
-      )) || optionsList[0];
+      // Prefer a one-shot allow over allow_always: a blanket grant is the agent's
+      // to keep for the session, and "Always" is a decision a human makes.
+      const allow = optionsList.find((o) => /^allow(_once)?$/i.test(String(o?.optionId || "")))
+        || optionsList.find((o) => /allow|accept|yes|approve/i.test(
+          String(o?.optionId || o?.name || o?.kind || ""),
+        ))
+        || optionsList[0];
+      // RequestPermissionResponse nests the outcome: { outcome: { outcome, optionId } }.
+      // Sending it FLAT is silently fatal — the harness reads response.outcome.outcome,
+      // gets undefined, falls to its else branch and answers the model with
+      // { behavior: "deny", message: "User refused permission to run tool", interrupt: true }.
+      // So every tool call became a refusal the human never made, and the turn aborted:
+      // agents that plainly had permission could not write files.
       const result = autoApprove
-        ? { outcome: "selected", optionId: allow?.optionId || allow?.id || "allow_once" }
-        : { outcome: "cancelled" };
+        ? { outcome: { outcome: "selected", optionId: allow?.optionId || allow?.id || "allow" } }
+        : { outcome: { outcome: "cancelled" } };
       write({ jsonrpc: "2.0", id: msg.id, result });
       return;
     }
@@ -295,12 +309,30 @@ export function createAcpClient(options) {
   }
 
   async function newSession(sessionCwd = cwd) {
+    // mcpServers is how an ACP agent is given tools. Sending [] — which this did,
+    // hardcoded — is why agents over ACP had no agensis tools at all: no read_doc,
+    // no list_docs, no post_message, no whoami. The classic path had always wired
+    // them (connectionExecutors.mjs), so the capability silently vanished the day
+    // jobs started preferring ACP.
     const result = await request("session/new", {
       cwd: pathResolve(sessionCwd),
-      mcpServers: [],
+      mcpServers: Array.isArray(mcpServers) ? mcpServers : [],
     });
     sessionId = result?.sessionId || result?.session_id || result?.id || null;
     if (!sessionId) throw new Error("session/new did not return a sessionId");
+    // The agent's configured permission mode has to be ASSERTED — a harness starts
+    // every session at "default" and there is no session/new field for it. Without
+    // this a yolo agent is still asked to approve each tool call, which is both
+    // wrong and, before the response-shape fix above, fatal.
+    if (permissionMode) {
+      try {
+        await request("session/set_mode", { sessionId, modeId: permissionMode });
+      } catch (error) {
+        // Older or simpler harnesses may not implement modes. Auto-approve still
+        // covers us, so this is a degradation, not a failure.
+        log(`[acp] session/set_mode ${permissionMode} not accepted: ${error?.message || error}`);
+      }
+    }
     return result;
   }
 

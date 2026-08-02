@@ -9,6 +9,43 @@ const acpUnavailable = new Set();
 /** @type {Map<string, { client: ReturnType<typeof createAcpClient>, harnessId: string, cwd: string }>} */
 const sessionPool = new Map();
 
+/**
+ * The agensis MCP server, in the shape ACP's session/new expects.
+ *
+ * An HTTP entry carries its headers as a LIST of {name,value} pairs — a harness
+ * turns them back into an object with Object.fromEntries, so an object here
+ * arrives as garbage. The classic path builds the same server as a keyed map
+ * (connectionExecutors.mjs); only the wire shape differs.
+ *
+ * Returns [] when the daemon has no MCP runtime configured, which is the honest
+ * "this agent has no workspace tools" case rather than a broken entry.
+ */
+export function acpMcpServers(mcp) {
+  const url = String(mcp?.url || "").trim();
+  if (!url) return [];
+  const token = String(mcp?.env?.AGENSIS_MCP_TOKEN || "").trim();
+  return [{
+    type: "http",
+    name: "agensis",
+    url,
+    ...(token ? { headers: [{ name: "Authorization", value: `Bearer ${token}` }] } : {}),
+  }];
+}
+
+/**
+ * agensis permission modes -> ACP session modes.
+ *
+ * A harness starts every session in "default" and asks before each tool call, so
+ * a yolo agent that never asserts its mode gets interrogated anyway. Mirrors
+ * mapClaudePermission in connectionExecutors.mjs so both paths agree.
+ */
+export function acpPermissionMode(permissionMode) {
+  const mode = String(permissionMode || "").trim();
+  if (mode === "yolo") return "bypassPermissions";
+  if (mode === "accept_edits") return "acceptEdits";
+  return "default";
+}
+
 function looksLikeUnavailable(error) {
   const message = String((error && error.message) || error || "");
   return /ENOENT|command not found|not available|not installed|ACP process exited|Cannot find module|timed out|EACCES/i.test(message);
@@ -88,8 +125,12 @@ export function createAcpExecutor(ctx = {}) {
       const promptText = opts.prompt != null
         ? String(opts.prompt)
         : String(Array.isArray(opts.args) ? opts.args[opts.args.length - 1] : "");
+      const mcpServers = acpMcpServers(opts.mcp);
+      const permissionMode = acpPermissionMode(opts.permissionMode);
       const sessionKey = String(opts.sessionKey || `${id}:${cwd}`);
-      const poolKey = `${id}::${sessionKey}`;
+      // Tools and permission mode are fixed at session/new, so a change to either
+      // must open a NEW session rather than silently reuse one built without them.
+      const poolKey = `${id}::${sessionKey}::${permissionMode}::${mcpServers.map((s) => s.url).join(",")}`;
 
       let entry = sessionPool.get(poolKey);
       if (entry?.client?.closed) {
@@ -113,6 +154,10 @@ export function createAcpExecutor(ctx = {}) {
             args: resolved.args,
             cwd,
             autoApprove: true,
+            // Without these the agent has no workspace tools and is asked to
+            // approve every call despite whatever mode it was configured with.
+            mcpServers,
+            permissionMode,
             clientName: "agensis-agent",
             onLog: () => {},
           });

@@ -1,6 +1,6 @@
 {
   "name": "@agensis/agensis-agent",
-  "version": "0.1.53",
+  "version": "0.1.54",
   "description": "Relay host for agensis workspace agents. Prefers ACP harnesses when installed (same adapters as desktop); falls back to classic coding CLIs. Ships as a single minified bundle.",
   "homepage": "https://agensis.io",
   "repository": {

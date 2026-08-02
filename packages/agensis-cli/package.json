@@ -1,6 +1,6 @@
 {
   "name": "agensis-cli",
-  "version": "0.1.53",
+  "version": "0.1.54",
   "private": true,
   "description": "Relay host source for agensis workspace agents. Connects to a workspace, receives @mention jobs, runs a coding CLI, posts results back (same path as desktop ACP).",
   "homepage": "https://agensis.io",
