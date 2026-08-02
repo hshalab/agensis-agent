@@ -1,6 +1,6 @@
 {
   "name": "agensis-agent-monorepo",
-  "version": "0.1.48",
+  "version": "0.1.49",
   "private": true,
   "description": "Open-source Relay host (agensis-agent) for Agensis workspace agents",
   "workspaces": [
