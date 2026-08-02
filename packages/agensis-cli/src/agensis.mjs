@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import process from "node:process";
 import WebSocket from "ws";
 import { createExecutor } from "./executor.mjs";
+import { willUseAcp } from "./acp/executor.mjs";
 import { runCli } from "./cli.mjs";
 import {
   ampFailureError,
@@ -1256,7 +1257,6 @@ async function runAgentJob(config, job, { signal, requestPermission = null }) {
   };
 
   sendDelta("");
-  const parser = command.streamJson ? createStreamJsonParser({ onStep: sendStep, onSegment: sendSegment }) : null;
   const progressTimer = setInterval(() => sendDelta(fullContent), 1000);
   if (progressTimer.unref) progressTimer.unref();
 
@@ -1267,6 +1267,16 @@ async function runAgentJob(config, job, { signal, requestPermission = null }) {
   const usesBareBinary = !/[\\/]/.test(command.cmd);
   const family = config.fastConnection && usesBareBinary
     ? (isClaudeCommand(command.cmd) ? "claude" : isCodexCommand(command.cmd) ? "codex" : null)
+    : null;
+  // An ACP run streams and returns PLAIN TEXT. createStreamJsonParser reads the
+  // NDJSON that `claude -p --output-format stream-json` emits. Feed one to the
+  // other and the parser yields nothing at all — which is how a complete answer
+  // reached the server as response:"" and rendered as
+  // "@handle finished without output." So the parser only exists for the path
+  // that actually speaks NDJSON.
+  const acpMode = willUseAcp({ job, family, config });
+  const parser = command.streamJson && !acpMode
+    ? createStreamJsonParser({ onStep: sendStep, onSegment: sendSegment })
     : null;
   const executor = createExecutor(job, { family, config });
   // Which warm session this conversation runs on. The SILO (workspace+agent) is
@@ -1340,10 +1350,19 @@ async function runAgentJob(config, job, { signal, requestPermission = null }) {
     clearInterval(progressTimer);
   }
 
+  // The executor is the authority on which path actually ran: ACP can be declined
+  // up front, or bail mid-run and hand the job back to the classic CLI. Trust what
+  // it reports over the pre-run guess, so the output is always read in the format
+  // it is actually in.
+  const ranAcp = result.acp === true;
+
   if (parser) {
     parser.end();
-    fullContent = parser.live;
-    sendDelta(fullContent); // flush the final tokens
+    // Plain ACP text leaves this parser empty; flushing it would blank the live view.
+    if (!ranAcp) {
+      fullContent = parser.live;
+      sendDelta(fullContent); // flush the final tokens
+    }
   }
 
   const stdout = String(result.stdout || "").trim();
@@ -1353,9 +1372,23 @@ async function runAgentJob(config, job, { signal, requestPermission = null }) {
     : result.status === 0
       ? ""
       : stderr || `Command exited with status ${result.status}`;
-  const response = parser
-    ? parser.result || (error ? "" : stderr)
-    : stdout || (error ? "" : stderr) || latest || "";
+  let response;
+  if (parser && !ranAcp) {
+    response = parser.result || (error ? "" : stderr);
+  } else if (!parser && !ranAcp && command.streamJson && stdout) {
+    // ACP was expected but the harness bailed, so the classic CLI ran after all
+    // and its output IS stream-json. Parse it rather than shipping raw NDJSON to
+    // the chat, which is the mirror image of the bug above.
+    const late = createStreamJsonParser({ onStep: () => { }, onSegment: () => { } });
+    late.feed(stdout);
+    late.end();
+    response = late.result || (error ? "" : stderr);
+  } else {
+    response = stdout || (error ? "" : stderr) || latest || "";
+  }
+  // The live view never saw ACP's text (no parser fed it), so land the answer
+  // there too rather than leaving the bubble empty until the result frame.
+  if (ranAcp && response) sendDelta(response);
 
   // Why the turn ended, in the shared vocabulary (stopReasons.mjs). Absent when
   // the executor could not tell us — LocalExecutor's raw subprocess has no
