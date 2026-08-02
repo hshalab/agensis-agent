@@ -5,6 +5,8 @@ import crypto from "node:crypto";
 import process from "node:process";
 import WebSocket from "ws";
 import { createExecutor } from "./executor.mjs";
+import { harnessAvailable } from "./acp/executor.mjs";
+import { preferredHarnessId } from "./acp/harnesses.mjs";
 import { runCli } from "./cli.mjs";
 import {
   ampFailureError,
@@ -72,7 +74,7 @@ const DEFAULT_MAX_CONCURRENCY = 2;
 const DEFAULT_SESSION_SLOTS = 1;
 const LEAN_PROMPT_MAX_BYTES = 10 * 1024;
 const DEFAULT_MODEL = "claude-opus-4-8";
-export const AGENSIS_CLI_VERSION = "0.1.50";
+export const AGENSIS_CLI_VERSION = "0.1.51";
 
 export async function runAgensisDaemon(rawConfig = {}) {
   const config = normalizeConfig(rawConfig);
@@ -1565,6 +1567,14 @@ async function buildPrompt(config, job) {
   const tools = Array.isArray(agent.tools) ? agent.tools.join(", ") : String(agent.tools || "");
   const model = resolveJobModel(config, job);
   const permissionMode = resolveJobPermissionMode(config, job);
+  // When this turn runs on a non-Claude ACP harness, the configured model name is
+  // not what answers — the harness brings its own model. Telling Grok or Goose
+  // "Requested model: claude-opus-5" is simply false, and the agent repeats it: it
+  // introduces itself as a Claude model and lists Claude models as its own.
+  const acpHarnessId = preferredHarnessId({ job, config });
+  const harnessRunsOwnModel = Boolean(
+    acpHarnessId && acpHarnessId !== "claude" && harnessAvailable(acpHarnessId),
+  );
   // Editable "what to do on each heartbeat" doc. Inlined so the agent sees its recurring
   // instructions without a tool call; the path is given so it can edit them.
   const heartbeatMd = await readHeartbeatMd(config).catch(() => null);
@@ -1576,7 +1586,9 @@ async function buildPrompt(config, job) {
     `Workspace: ${job.workspaceId || config.workspace}`,
     `Channel session: ${job.sessionId || ""}`,
     `Agent: ${agent.name || config.name} (@${agent.handle || config.handle})`,
-    `Requested model: ${model}`,
+    harnessRunsOwnModel
+      ? `Runtime: ${acpHarnessId} (ACP). This harness supplies its own model — you are ${acpHarnessId}, not Claude. Do not describe yourself as a Claude model or list Claude models as your own.`
+      : `Requested model: ${model}`,
     `Permission mode: ${permissionMode}`,
     agent.description ? `Description:\n${agent.description}` : "",
     agent.soul ? `Soul:\n${agent.soul}` : "",
