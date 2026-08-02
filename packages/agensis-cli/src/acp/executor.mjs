@@ -34,6 +34,21 @@ export function harnessAvailable(harnessId, opts = {}) {
 }
 
 /**
+ * Will this job actually run over ACP on this host? The same gate
+ * createPreferAcpExecutor applies, exposed so a caller can set up its output
+ * handling BEFORE the run rather than guessing after it.
+ *
+ * This matters because the two paths speak different formats: ACP streams and
+ * returns PLAIN TEXT, while the classic `claude -p` path emits stream-json
+ * NDJSON. A caller that parses one as the other silently ends up with nothing.
+ */
+export function willUseAcp({ job, family, config } = {}) {
+  if (!acpPreferred({ config })) return false;
+  const harnessId = preferredHarnessId({ job, family, config });
+  return Boolean(harnessId && harnessAvailable(harnessId));
+}
+
+/**
  * @param {{ job?: object, family?: string|null, config?: object }} ctx
  */
 export function createAcpExecutor(ctx = {}) {
