@@ -1393,6 +1393,24 @@ async function runAgentJob(config, job, { signal, requestPermission = null }) {
   // structured result to read — and the server treats absent exactly as it
   // treated every result before this field existed.
   const stop = result.stop && typeof result.stop === "object" ? result.stop : null;
+  // Token counts for server metering (usage_events). Counts only — never invent
+  // numbers, never forward unknown keys. Absent when the runtime had no usage
+  // (LocalExecutor, Amp, older SDKs).
+  const stopUsage = (() => {
+    const raw = stop?.usage;
+    if (!raw || typeof raw !== "object") return null;
+    const out = {};
+    for (const key of [
+      "input_tokens",
+      "output_tokens",
+      "cache_creation_input_tokens",
+      "cache_read_input_tokens",
+    ]) {
+      const n = Number(raw[key]);
+      if (Number.isFinite(n) && n > 0) out[key] = Math.round(n);
+    }
+    return Object.keys(out).length > 0 ? out : null;
+  })();
   sendResult(job, {
     action: "agent_job_result",
     jobId: job.id,
@@ -1406,6 +1424,7 @@ async function runAgentJob(config, job, { signal, requestPermission = null }) {
       // broadcast in v1 — agent_jobs.metadata is fanned out to clients.
       costUsd: stop.costUsd || 0,
       permissionDenials: stop.permissionDenials || 0,
+      ...(stopUsage ? { usage: stopUsage } : {}),
     } : {}),
     elapsedMs: Date.now() - started,
     model: command.model,
