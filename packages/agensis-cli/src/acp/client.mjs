@@ -1,13 +1,41 @@
-// Minimal ACP client over a child process stdio (NDJSON JSON-RPC 2.0).
-// Ported from agensis electron/acp/client.cjs for the Relay CLI.
+// ACP client, over the OFFICIAL @agentclientprotocol/sdk.
+//
+// This file used to be ~400 lines of hand-rolled NDJSON JSON-RPC 2.0: framing,
+// id correlation, pending-request maps, inbound-request dispatch. That layer
+// produced three protocol bug-fix releases in about 24 hours (0.1.49 answers
+// arriving empty, 0.1.54 agents losing their tools and their write access), so
+// it is now the SDK's job. Zed publishes and maintains it; the protocol is
+// theirs.
+//
+// The EXPORTED SURFACE IS UNCHANGED on purpose — createAcpClient still returns
+// { sessionId, initializeResult, pid, closed, initialize, newSession, prompt,
+// cancel, dispose, request } — so acp/executor.mjs (session pool, handshake
+// budgets, prewarm, direct fallback) did not have to change at all.
+//
+// NOTE ON NAMING, because two different SDKs are in play and they are easy to
+// confuse: this is @agentclientprotocol/sdk, the ACP wire protocol. It is NOT
+// @anthropic-ai/claude-agent-sdk, which is the Claude direct lane in
+// connectionExecutors.mjs. Nothing here touches that path.
+//
 // Spec: https://agentclientprotocol.com/protocol/overview
 
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { Readable, Writable } from "node:stream";
 import { delimiter, isAbsolute, join, resolve as pathResolve } from "node:path";
+import {
+  client as createClientApp,
+  methods,
+  ndJsonStream,
+  PROTOCOL_VERSION as SDK_PROTOCOL_VERSION,
+} from "@agentclientprotocol/sdk";
 
-export const PROTOCOL_VERSION = 1;
+/** Re-exported from the SDK so the protocol version can never drift from it. */
+export const PROTOCOL_VERSION = SDK_PROTOCOL_VERSION;
+
+/** Largest file the agent may pull in through fs/read_text_file. */
+const MAX_READ_BYTES = 512 * 1024;
 
 function buildPathEnv() {
   const parts = [];
@@ -58,6 +86,22 @@ export function extractTextFromResult(result) {
 }
 
 /**
+ * Choose which permission option to answer a session/request_permission with.
+ *
+ * Prefers a ONE-SHOT allow over allow_always: a blanket grant is a decision a
+ * human makes, not one the daemon makes on their behalf. Exported so the
+ * choice is testable without driving a whole session.
+ */
+export function pickPermissionOption(optionsList) {
+  const list = Array.isArray(optionsList) ? optionsList : [];
+  return list.find((o) => /^allow(_once)?$/i.test(String(o?.optionId || "")))
+    || list.find((o) => /allow|accept|yes|approve/i.test(
+      String(o?.optionId || o?.name || o?.kind || ""),
+    ))
+    || list[0];
+}
+
+/**
  * @param {{
  *   command: string,
  *   args?: string[],
@@ -85,15 +129,11 @@ export function createAcpClient(options) {
     clientName = "agensis-agent",
   } = options;
 
-  let nextId = 1;
-  /** @type {Map<number, { resolve: Function, reject: Function }>} */
-  const pending = new Map();
   /** @type {Set<(params: object) => void>} */
   const updateHandlers = new Set();
   if (typeof onUpdate === "function") updateHandlers.add(onUpdate);
 
   let closed = false;
-  let buffer = "";
   let sessionId = null;
   let initializeResult = null;
 
@@ -120,60 +160,18 @@ export function createAcpClient(options) {
 
   child.on("error", (err) => {
     closed = true;
-    for (const [, p] of pending) p.reject(err);
-    pending.clear();
+    log(`[acp] process error: ${err?.message || err}`);
   });
 
   child.on("exit", (code, signal) => {
     closed = true;
-    const err = new Error(`ACP process exited (code=${code}, signal=${signal || "none"})`);
-    for (const [, p] of pending) p.reject(err);
-    pending.clear();
+    // Keep this wording: acp/executor.mjs's looksLikeUnavailable() matches
+    // "ACP process exited" to decide that a harness is structurally broken
+    // rather than merely slow.
+    const message = `ACP process exited (code=${code}, signal=${signal || "none"})`;
+    log(`[acp] ${message}`);
+    try { connection?.close(new Error(message)); } catch { /* already closing */ }
   });
-
-  child.stdout.setEncoding("utf8");
-  child.stdout.on("data", (chunk) => {
-    buffer += chunk;
-    let idx;
-    while ((idx = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, idx).trim();
-      buffer = buffer.slice(idx + 1);
-      if (!line) continue;
-      let msg;
-      try {
-        msg = JSON.parse(line);
-      } catch {
-        log(`[bad-json] ${line.slice(0, 200)}`);
-        continue;
-      }
-      handleMessage(msg);
-    }
-  });
-
-  function write(msg) {
-    if (closed || !child.stdin.writable) {
-      throw new Error("ACP process is not writable");
-    }
-    child.stdin.write(`${JSON.stringify(msg)}\n`);
-  }
-
-  function request(method, params = {}) {
-    if (closed) return Promise.reject(new Error("ACP process is closed"));
-    const id = nextId++;
-    return new Promise((resolve, reject) => {
-      pending.set(id, { resolve, reject });
-      try {
-        write({ jsonrpc: "2.0", id, method, params });
-      } catch (err) {
-        pending.delete(id);
-        reject(err);
-      }
-    });
-  }
-
-  function notify(method, params = {}) {
-    write({ jsonrpc: "2.0", method, params });
-  }
 
   function emitUpdate(params) {
     for (const handler of updateHandlers) {
@@ -185,151 +183,80 @@ export function createAcpClient(options) {
     }
   }
 
-  function handleMessage(msg) {
-    if (msg && Object.prototype.hasOwnProperty.call(msg, "id")
-      && (msg.result !== undefined || msg.error)) {
-      const waiter = pending.get(msg.id);
-      if (!waiter) return;
-      pending.delete(msg.id);
-      if (msg.error) {
-        const err = new Error(msg.error.message || JSON.stringify(msg.error));
-        err.code = msg.error.code;
-        err.data = msg.error.data;
-        waiter.reject(err);
-      } else {
-        waiter.resolve(msg.result);
-      }
-      return;
-    }
-
-    if (msg && msg.method && Object.prototype.hasOwnProperty.call(msg, "id")) {
-      void handleAgentRequest(msg).catch((err) => {
-        try {
-          write({
-            jsonrpc: "2.0",
-            id: msg.id,
-            error: { code: -32000, message: err?.message || String(err) },
-          });
-        } catch {
-          // process gone
-        }
-      });
-      return;
-    }
-
-    if (msg && msg.method === "session/update") {
-      emitUpdate(msg.params || {});
-      return;
-    }
-    if (msg && msg.method) log(`[notify] ${msg.method}`);
-  }
-
-  async function handleAgentRequest(msg) {
-    const method = msg.method;
-    const params = msg.params || {};
-
-    if (method === "session/request_permission") {
-      const optionsList = Array.isArray(params.options) ? params.options : [];
-      // Prefer a one-shot allow over allow_always: a blanket grant is the agent's
-      // to keep for the session, and "Always" is a decision a human makes.
-      const allow = optionsList.find((o) => /^allow(_once)?$/i.test(String(o?.optionId || "")))
-        || optionsList.find((o) => /allow|accept|yes|approve/i.test(
-          String(o?.optionId || o?.name || o?.kind || ""),
-        ))
-        || optionsList[0];
-      // RequestPermissionResponse nests the outcome: { outcome: { outcome, optionId } }.
-      // Sending it FLAT is silently fatal — the harness reads response.outcome.outcome,
-      // gets undefined, falls to its else branch and answers the model with
-      // { behavior: "deny", message: "User refused permission to run tool", interrupt: true }.
-      // So every tool call became a refusal the human never made, and the turn aborted:
-      // agents that plainly had permission could not write files.
-      const result = autoApprove
-        ? { outcome: { outcome: "selected", optionId: allow?.optionId || allow?.id || "allow" } }
+  const app = createClientApp({ name: clientName })
+    .onRequest(methods.client.session.requestPermission, ({ params }) => {
+      const option = pickPermissionOption(params?.options);
+      // RequestPermissionResponse NESTS the outcome. Sending it flat is silently
+      // fatal: the harness reads response.outcome.outcome, gets undefined, and
+      // answers the model with a refusal the human never made — which is how
+      // agents that plainly had permission could not write files (0.1.54).
+      // The SDK validates this shape now, so it cannot silently regress again.
+      return autoApprove
+        ? { outcome: { outcome: "selected", optionId: option?.optionId || option?.id || "allow" } }
         : { outcome: { outcome: "cancelled" } };
-      write({ jsonrpc: "2.0", id: msg.id, result });
-      return;
-    }
-
-    if (method === "fs/read_text_file") {
-      const filePath = String(params.path || "");
+    })
+    .onRequest(methods.client.fs.readTextFile, ({ params }) => {
+      const filePath = String(params?.path || "");
       if (!isAbsolute(filePath)) {
-        write({
-          jsonrpc: "2.0",
-          id: msg.id,
-          error: { code: -32602, message: "path must be absolute" },
-        });
-        return;
+        throw new Error("path must be absolute");
       }
-      try {
-        let content = readFileSync(filePath, "utf8");
-        const max = 512 * 1024;
-        if (content.length > max) content = content.slice(0, max);
-        write({ jsonrpc: "2.0", id: msg.id, result: { content } });
-      } catch (err) {
-        write({
-          jsonrpc: "2.0",
-          id: msg.id,
-          error: { code: -32000, message: err?.message || String(err) },
-        });
-      }
-      return;
-    }
-
-    if (method === "fs/write_text_file") {
-      write({
-        jsonrpc: "2.0",
-        id: msg.id,
-        error: { code: -32601, message: "fs/write_text_file not enabled in agensis-agent ACP v1" },
-      });
-      return;
-    }
-
-    write({
-      jsonrpc: "2.0",
-      id: msg.id,
-      error: { code: -32601, message: `Method not found: ${method}` },
+      let content = readFileSync(filePath, "utf8");
+      if (content.length > MAX_READ_BYTES) content = content.slice(0, MAX_READ_BYTES);
+      return { content };
+    })
+    .onRequest(methods.client.fs.writeTextFile, () => {
+      // Writes go through the agent's own tools, not through the client.
+      throw new Error("fs/write_text_file not enabled in agensis-agent ACP v1");
+    })
+    .onNotification(methods.client.session.update, ({ params }) => {
+      emitUpdate(params || {});
     });
+
+  // Web streams over the child's stdio; the SDK owns framing and correlation.
+  const stream = ndJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.stdout));
+  const connection = app.connect(stream);
+  connection.closed?.then?.(() => { closed = true; }, () => { closed = true; });
+
+  function request(method, params = {}) {
+    if (closed) return Promise.reject(new Error("ACP process is closed"));
+    return connection.agent.request(method, params);
   }
 
   async function initialize() {
-    initializeResult = await request("initialize", {
+    initializeResult = await request(methods.agent.initialize, {
       protocolVersion: PROTOCOL_VERSION,
       clientCapabilities: {
         fs: { readTextFile: true, writeTextFile: false },
         terminal: false,
       },
-      clientInfo: { name: clientName, title: "agensis-agent", version: process.env.npm_package_version || "0.1.0" },
+      clientInfo: {
+        name: clientName,
+        title: "agensis-agent",
+        version: process.env.npm_package_version || "0.1.0",
+      },
     });
-    try {
-      notify("notifications/initialized", {});
-    } catch {
-      // optional
-    }
     return initializeResult;
   }
 
   async function newSession(sessionCwd = cwd) {
-    // mcpServers is how an ACP agent is given tools. Sending [] — which this did,
-    // hardcoded — is why agents over ACP had no agensis tools at all: no read_doc,
-    // no list_docs, no post_message, no whoami. The classic path had always wired
-    // them (connectionExecutors.mjs), so the capability silently vanished the day
-    // jobs started preferring ACP.
-    const result = await request("session/new", {
+    // mcpServers is how an ACP agent is given tools. Sending [] — which an
+    // earlier version did, hardcoded — is why agents over ACP had no agensis
+    // tools at all: no read_doc, no list_docs, no post_message, no whoami.
+    const result = await request(methods.agent.session.new, {
       cwd: pathResolve(sessionCwd),
       mcpServers: Array.isArray(mcpServers) ? mcpServers : [],
     });
     sessionId = result?.sessionId || result?.session_id || result?.id || null;
     if (!sessionId) throw new Error("session/new did not return a sessionId");
-    // The agent's configured permission mode has to be ASSERTED — a harness starts
-    // every session at "default" and there is no session/new field for it. Without
-    // this a yolo agent is still asked to approve each tool call, which is both
-    // wrong and, before the response-shape fix above, fatal.
+    // The agent's configured permission mode has to be ASSERTED — a harness
+    // starts every session at "default" and session/new has no field for it.
+    // Without this a yolo agent is still interrogated on every tool call.
     if (permissionMode) {
       try {
-        await request("session/set_mode", { sessionId, modeId: permissionMode });
+        await request(methods.agent.session.setMode, { sessionId, modeId: permissionMode });
       } catch (error) {
-        // Older or simpler harnesses may not implement modes. Auto-approve still
-        // covers us, so this is a degradation, not a failure.
+        // Older or simpler harnesses may not implement modes. Auto-approve
+        // still covers us, so this is a degradation, not a failure.
         log(`[acp] session/set_mode ${permissionMode} not accepted: ${error?.message || error}`);
       }
     }
@@ -353,7 +280,7 @@ export function createAcpClient(options) {
     };
     updateHandlers.add(handler);
     try {
-      const result = await request("session/prompt", {
+      const result = await request(methods.agent.session.prompt, {
         sessionId,
         prompt: [{ type: "text", text: String(text || "") }],
       });
@@ -371,7 +298,10 @@ export function createAcpClient(options) {
   function cancel() {
     if (!sessionId || closed) return;
     try {
-      notify("session/cancel", { sessionId });
+      const sent = connection.agent.notify(methods.agent.session.cancel, { sessionId });
+      if (sent && typeof sent.catch === "function") {
+        sent.catch(() => { /* a cancel that cannot be delivered is moot */ });
+      }
     } catch {
       // ignore
     }
@@ -379,6 +309,7 @@ export function createAcpClient(options) {
 
   function dispose() {
     closed = true;
+    try { connection.close(); } catch { /* ignore */ }
     try { child.stdin.end(); } catch { /* ignore */ }
     try { child.kill("SIGTERM"); } catch { /* ignore */ }
     const t = setTimeout(() => {

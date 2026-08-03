@@ -88,7 +88,15 @@ test("an auto-approved permission reply nests its outcome, as the harness reads 
           process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } }) + "\\n");
           process.stdout.write(JSON.stringify({
             jsonrpc: "2.0", id: 9001, method: "session/request_permission",
-            params: { sessionId: "s1", options: [
+            // toolCall is REQUIRED by the ACP schema
+            // (RequestPermissionRequest.required = sessionId, toolCall, options).
+            // This fixture used to omit it and still "passed", because the old
+            // hand-rolled client validated nothing. The official SDK rejects the
+            // frame with -32602 Invalid params, which is the correct behaviour —
+            // so the fixture is now a spec-valid request, as a real harness sends.
+            params: { sessionId: "s1", toolCall: {
+              toolCallId: "call-1", title: "Write a file", kind: "edit", status: "pending",
+            }, options: [
               { kind: "allow_always", name: "Always Allow", optionId: "allow_always" },
               { kind: "allow_once", name: "Allow", optionId: "allow" },
               { kind: "reject_once", name: "Reject", optionId: "reject" },
