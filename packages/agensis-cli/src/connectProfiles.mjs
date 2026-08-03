@@ -22,6 +22,12 @@ const PROFILE_KEYS = [
   "timeoutMs",
   "heartbeatMs",
   "maxConcurrency",
+  // Persisted alongside maxConcurrency because the two only work as a pair:
+  // slots are clamped to [1, maxConcurrency], so a profile that remembered the
+  // concurrency but forgot the slots came back with one connection — which is
+  // exactly the "--max-concurrency is a no-op" symptom sessionSlots.mjs exists
+  // to fix, reintroduced silently on every --profile restart.
+  "sessionSlots",
   "share",
   "sharedModelsFile",
   "noCoding",

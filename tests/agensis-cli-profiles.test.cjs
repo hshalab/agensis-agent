@@ -230,3 +230,44 @@ test('normalized no-coding state survives the real profile write and read path',
     await fs.rm(home, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// sessionSlots must survive a profile round-trip.
+//
+// maxConcurrency was persisted and sessionSlots was not, and the two only work
+// as a pair: slots are clamped to [1, maxConcurrency], so a profile that
+// remembered 8 concurrency and forgot the slots came back with one connection.
+// That is precisely the "--max-concurrency is a no-op" symptom sessionSlots.mjs
+// was written to fix — reintroduced silently on every --profile restart.
+// ---------------------------------------------------------------------------
+
+test('sessionSlots survives the real profile write and read path', async () => {
+  const os = require('node:os');
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agensis-slots-'));
+  const prev = process.env.AGENSIS_HOME;
+  process.env.AGENSIS_HOME = dir;
+  try {
+    const mod = await import('../packages/agensis-cli/src/connectProfiles.mjs');
+    const config = {
+      url: 'https://example.invalid',
+      token: 'aga_' + 'x'.repeat(32),
+      workspace: 'w1',
+      agent: 'a1',
+      handle: 'coder',
+      maxConcurrency: 8,
+      sessionSlots: 8,
+    };
+    await mod.writeDaemonProfile('slots-test', config);
+    const back = await mod.readDaemonProfile('slots-test');
+
+    assert.equal(Number(back.sessionSlots), 8,
+      'sessionSlots must round-trip; without it a --profile restart silently falls back to one connection');
+    assert.equal(Number(back.maxConcurrency), 8,
+      'and its ceiling must round-trip too, or the slots get clamped back down');
+  } finally {
+    if (prev === undefined) delete process.env.AGENSIS_HOME; else process.env.AGENSIS_HOME = prev;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
