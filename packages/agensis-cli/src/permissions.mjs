@@ -197,6 +197,34 @@ function denial(message) {
 }
 
 /**
+ * One canonical decision shape for both the legacy one-frame path and the
+ * prepare/commit path. The prepared value is compared field-for-field on a
+ * retry, so a second frame can re-send a lost receipt but can never replace the
+ * human's first decision while the tool call is parked.
+ */
+function normalizeDecision(message) {
+  return {
+    behavior: message?.behavior === "allow" ? "allow" : "deny",
+    scope: PERMISSION_SCOPES.includes(message?.scope) ? message.scope : "once",
+    decidedBy: String(message?.decidedBy || "").trim(),
+    message: String(message?.message || "").trim(),
+  };
+}
+
+function sameDecision(left, right) {
+  return left?.behavior === right?.behavior
+    && left?.scope === right?.scope
+    && left?.decidedBy === right?.decidedBy
+    && left?.message === right?.message;
+}
+
+function decisionResult(decision) {
+  return decision.behavior === "allow"
+    ? { behavior: "allow", scope: decision.scope, decidedBy: decision.decidedBy }
+    : denial(decision.message || `${decision.decidedBy || "The workspace"} denied this tool call.`);
+}
+
+/**
  * Asks Agensis for a decision and parks until a human answers.
  *
  * `send` returns false when the socket is gone. That is a hard deny rather than
@@ -212,7 +240,7 @@ export function createPermissionBroker({
   idFactory = () => crypto.randomUUID(),
 } = {}) {
   if (typeof send !== "function") throw new Error("createPermissionBroker requires send()");
-  const pending = new Map(); // requestId -> { jobId, settle }
+  const pending = new Map(); // requestId -> { jobId, timer, resolve, prepared, preparedReceipted, preparedConflicted }
 
   const settle = (requestId, result) => {
     const entry = pending.get(requestId);
@@ -255,7 +283,14 @@ export function createPermissionBroker({
           settle(requestId, denial(`Nobody approved this within ${Math.round(timeoutMs / 60000)} minutes. Ask again in the chat, or have the workspace grant it on the agent.`));
         }, timeoutMs);
         timer.unref?.();
-        const entry = { jobId: jobId || "", timer, resolve };
+        const entry = {
+          jobId: jobId || "",
+          timer,
+          resolve,
+          prepared: null,
+          preparedReceipted: false,
+          preparedConflicted: false,
+        };
         pending.set(requestId, entry);
         // A cancelled job must not leave a turn parked on a question whose
         // answer can no longer matter.
@@ -268,14 +303,86 @@ export function createPermissionBroker({
     /** Apply an inbound `agent_permission_decision` frame. */
     decide(message) {
       const requestId = String(message?.requestId || "");
+      const entry = pending.get(requestId);
+      // A legacy decision cannot bypass a prepare that is already waiting for
+      // its commit. Old servers never send prepare, so compatibility is intact.
+      if (!requestId || !entry || entry.prepared) return false;
+      const decision = normalizeDecision(message);
+      log(`permission ${decision.behavior === "allow" ? `allowed (${decision.scope})` : "denied"} for ${requestId}${decision.decidedBy ? ` by ${decision.decidedBy}` : ""}`);
+      return settle(requestId, decisionResult(decision));
+    },
+
+    /**
+     * Cache an inbound decision and receipt it without releasing canUseTool.
+     *
+     * `sendReceipt` is supplied by the socket handler so the acknowledgement is
+     * written to the exact live socket that delivered the prepare, rather than
+     * whichever socket a reconnect may have installed in the meantime.
+     */
+    prepare(message, sendReceipt = send) {
+      const requestId = String(message?.requestId || "");
+      const entry = pending.get(requestId);
+      const decision = normalizeDecision(message);
+      const conflict = Boolean(entry?.prepared && !sameDecision(entry.prepared, decision));
+      if (conflict) {
+        // commit carries only requestId, so after two different decisions there
+        // is no way to prove which one it refers to. Poison this park rather
+        // than risk executing either decision.
+        entry.preparedConflicted = true;
+        entry.preparedReceipted = false;
+      }
+      const accepted = Boolean(
+        requestId
+        && entry
+        && !entry.preparedConflicted
+        && (!entry.prepared || sameDecision(entry.prepared, decision)),
+      );
+
+      if (accepted && !entry.prepared) entry.prepared = decision;
+
+      let delivered = false;
+      try {
+        delivered = sendReceipt({
+          action: "agent_permission_prepared",
+          requestId,
+          accepted,
+        }) === true;
+      } catch {
+        delivered = false;
+      }
+
+      if (!accepted || !delivered) return false;
+      // Set only AFTER sendReceipt returns success. commit() checks this bit, so
+      // a failed acknowledgement can never release the parked tool call.
+      entry.preparedReceipted = true;
+      log(`permission decision prepared for ${requestId}`);
+      return true;
+    },
+
+    /** Apply an inbound commit exactly once, after a successful receipt. */
+    commit(message) {
+      const requestId = String(message?.requestId || "");
+      const entry = pending.get(requestId);
+      if (!requestId || !entry?.prepared || !entry.preparedReceipted) return false;
+      const decision = entry.prepared;
+      log(`permission ${decision.behavior === "allow" ? `allowed (${decision.scope})` : "denied"} for ${requestId}${decision.decidedBy ? ` by ${decision.decidedBy}` : ""}`);
+      return settle(requestId, decisionResult(decision));
+    },
+
+    /**
+     * Apply an explicit server abort to any parked request, prepared or not.
+     *
+     * The legacy decision lane deliberately cannot touch prepared entries, so
+     * clear/cancel needs its own terminal frame. settle() deletes first, making
+     * duplicate aborts and any later commit harmless no-ops.
+     */
+    abort(message) {
+      const requestId = String(message?.requestId || "");
       if (!requestId || !pending.has(requestId)) return false;
-      const allowed = message.behavior === "allow";
-      const scope = PERMISSION_SCOPES.includes(message.scope) ? message.scope : "once";
-      const decidedBy = String(message.decidedBy || "").trim();
-      log(`permission ${allowed ? `allowed (${scope})` : "denied"} for ${requestId}${decidedBy ? ` by ${decidedBy}` : ""}`);
-      return settle(requestId, allowed
-        ? { behavior: "allow", scope, decidedBy }
-        : denial(String(message.message || "").trim() || `${decidedBy || "The workspace"} denied this tool call.`));
+      const reason = String(message?.message || message?.reason || "").trim()
+        || "This permission request was cancelled.";
+      log(`permission request aborted for ${requestId}`);
+      return settle(requestId, denial(reason));
     },
 
     /**

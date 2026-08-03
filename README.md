@@ -36,6 +36,27 @@ the repository the agent should work in:
 agensis connect --url https://agensis.io --token aga_... --workspace ... --agent ...
 ```
 
+After that first successful connection has saved a local profile, keep the
+agent running when the terminal or desktop app exits:
+
+```sh
+agensis service install --profile default
+agensis service status --profile default
+agensis service logs --profile default
+```
+
+`service install` creates a per-user macOS LaunchAgent (`RunAtLoad` +
+`KeepAlive`) or Linux systemd user unit (`Restart=always`). Install the CLI
+globally first so the recorded executable path remains stable. The service
+definition contains only the profile name plus executable and log paths; the
+connection token, workspace, agent id, and working directory remain in the
+existing mode-0600 profile under `~/.agensis/daemon-profiles`.
+
+Use `agensis service logs --profile default --follow` only when you want a
+foreground live tail, and `agensis service uninstall --profile default` to
+disable and remove that exact profile's service. Windows service installation
+is not implemented; the command fails without changing the machine.
+
 Lean execution is enabled by default. Claude starts in safe mode, Codex skips
 user config, project instructions, memories, plugins, hooks, and skill search,
 and both receive only the Agensis MCP configuration. Use

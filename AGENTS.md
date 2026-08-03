@@ -43,10 +43,12 @@ automatic rollback if the new version doesn't come up healthy.
   see `packages/agensis-cli/src/supervise.mjs`).
 - **Surviving a killed supervisor**: `agensis supervise` is a separate process
   from the daemon it spawns, deliberately dumb and stable, so it keeps running
-  across daemon crashes/updates. It should be run under a process manager with
-  its own restart policy (systemd `Restart=always`, launchd `KeepAlive`, pm2)
-  so that even if it is itself killed, the OS brings it back; on restart it
-  re-derives everything from disk (no in-memory state to lose).
+  across daemon crashes/updates. `agensis service install --profile <name>`
+  installs it under a macOS user LaunchAgent (`KeepAlive`) or Linux systemd user
+  unit (`Restart=always`), so the OS brings it back if it is killed. The service
+  file contains no token/workspace data; it selects the existing mode-0600
+  daemon profile by name. On restart, supervise re-derives everything from disk
+  (no in-memory state to lose).
 - Scoped to host daemons for now — `run_mode: 'sandbox'` (e2b) jobs run in an
   ephemeral VM with no persistent installed daemon to update in this sense.
 

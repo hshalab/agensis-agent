@@ -195,6 +195,98 @@ test('a request rides the socket and resolves with the decision that comes back'
   assert.equal(broker.pendingCount(), 0);
 });
 
+test('prepare receipts the exact decision but commit is what resolves it', async () => {
+  const { createPermissionBroker } = await loadPermissions();
+  const receipts = [];
+  const broker = createPermissionBroker({ send: () => true, idFactory: () => 'req-1' });
+  let settled = false;
+  const pending = broker.request({ jobId: 'job-1', toolName: 'Bash' });
+  pending.then(() => { settled = true; });
+
+  assert.equal(broker.prepare({
+    requestId: 'req-1',
+    behavior: 'allow',
+    scope: 'always',
+    decidedBy: '  Jason  ',
+    message: '  approved  ',
+  }, (frame) => { receipts.push(frame); return true; }), true);
+  assert.deepEqual(receipts, [{ action: 'agent_permission_prepared', requestId: 'req-1', accepted: true }]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, 'a receipt must not let the tool execute before commit');
+  assert.equal(broker.pendingCount(), 1);
+
+  assert.equal(broker.commit({ requestId: 'req-1' }), true);
+  assert.deepEqual(await pending, { behavior: 'allow', scope: 'always', decidedBy: 'Jason' });
+  assert.equal(broker.commit({ requestId: 'req-1' }), false, 'a duplicate commit must not execute twice');
+});
+
+test('unknown and conflicting prepare or commit frames fail closed', async () => {
+  const { createPermissionBroker } = await loadPermissions();
+  const receipts = [];
+  const broker = createPermissionBroker({ send: () => true, idFactory: () => 'req-1' });
+  const pending = broker.request({ jobId: 'job-1', toolName: 'Bash' });
+  const receipt = (frame) => { receipts.push(frame); return true; };
+
+  assert.equal(broker.prepare({ requestId: 'missing', behavior: 'allow', scope: 'once' }, receipt), false);
+  assert.deepEqual(receipts.shift(), { action: 'agent_permission_prepared', requestId: 'missing', accepted: false });
+  assert.equal(broker.commit({ requestId: 'missing' }), false);
+
+  assert.equal(broker.prepare({ requestId: 'req-1', behavior: 'allow', scope: 'session', decidedBy: 'Jason' }, receipt), true);
+  assert.equal(broker.prepare({ requestId: 'req-1', behavior: 'deny', scope: 'session', decidedBy: 'Jason' }, receipt), false);
+  assert.deepEqual(receipts.at(-1), { action: 'agent_permission_prepared', requestId: 'req-1', accepted: false });
+  assert.equal(broker.pendingCount(), 1, 'the conflicting decision must not replace or resolve the original');
+
+  assert.equal(broker.commit({ requestId: 'req-1' }), false, 'a commit is ambiguous after conflicting decisions');
+  assert.equal(broker.prepare({ requestId: 'req-1', behavior: 'allow', scope: 'session', decidedBy: 'Jason' }, receipt), false, 'a conflict poisons the park rather than allowing either decision later');
+  assert.equal(broker.shutdown(), 1);
+  assert.equal((await pending).behavior, 'deny');
+});
+
+test('a failed prepare receipt remains parked until the same decision is receipted', async () => {
+  const { createPermissionBroker } = await loadPermissions();
+  const broker = createPermissionBroker({ send: () => true, idFactory: () => 'req-1' });
+  let settled = false;
+  const pending = broker.request({ jobId: 'job-1', toolName: 'Edit' });
+  pending.then(() => { settled = true; });
+  const decision = { requestId: 'req-1', behavior: 'deny', scope: 'once', decidedBy: 'Jason', message: 'Not this time.' };
+
+  assert.equal(broker.prepare(decision, () => false), false);
+  assert.equal(broker.commit({ requestId: 'req-1' }), false, 'an unreceipted decision cannot be committed');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.equal(broker.pendingCount(), 1);
+
+  // The failed write may be retried after reconnect. An exact duplicate is
+  // idempotent; a different decision would be rejected as a conflict.
+  assert.equal(broker.prepare(decision, () => true), true);
+  assert.equal(broker.commit({ requestId: 'req-1' }), true);
+  assert.deepEqual(await pending, { behavior: 'deny', message: 'Not this time.' });
+});
+
+test('abort denies ordinary and prepared requests exactly once', async () => {
+  const { createPermissionBroker } = await loadPermissions();
+  const broker = createPermissionBroker({
+    send: () => true,
+    idFactory: (() => { let n = 0; return () => `req-${n += 1}`; })(),
+  });
+  const ordinary = broker.request({ jobId: 'job-1', toolName: 'Bash' });
+  const prepared = broker.request({ jobId: 'job-2', toolName: 'Edit' });
+
+  assert.equal(broker.prepare({ requestId: 'req-2', behavior: 'allow', scope: 'once' }, () => true), true);
+  assert.equal(broker.abort({ requestId: 'req-1', message: 'The app cleared this request.' }), true);
+  assert.equal(broker.abort({ requestId: 'req-2' }), true, 'a prepared request must still be abortable');
+  assert.equal(broker.abort({ requestId: 'req-2' }), false, 'duplicate abort is ignored');
+  assert.equal(broker.commit({ requestId: 'req-2' }), false, 'commit after abort cannot execute the tool');
+  assert.equal(broker.abort({ requestId: 'missing' }), false);
+
+  assert.deepEqual(await ordinary, { behavior: 'deny', message: 'The app cleared this request.' });
+  assert.deepEqual(await prepared, {
+    behavior: 'deny',
+    message: 'This permission request was cancelled.',
+  });
+  assert.equal(broker.pendingCount(), 0);
+});
+
 test('a request with no rule to store offers only once and session', async () => {
   const { createPermissionBroker } = await loadPermissions();
   const sent = [];
@@ -274,6 +366,38 @@ test('a request the server re-homed keeps waiting for its human', async () => {
   // And the decision that eventually arrives still settles it.
   assert.equal(broker.decide({ requestId: 'req-1', behavior: 'allow', scope: 'once' }), true);
   assert.equal((await parked).behavior, 'allow');
+});
+
+test('a prepared decision survives reconnect and still waits for commit', async () => {
+  const { createPermissionBroker } = await loadPermissions();
+  const broker = createPermissionBroker({ send: () => true, idFactory: () => 'req-1' });
+  let settled = false;
+  const parked = broker.request({ jobId: 'job-1', toolName: 'Edit' });
+  parked.then(() => { settled = true; });
+
+  assert.equal(broker.prepare({ requestId: 'req-1', behavior: 'allow', scope: 'once' }, () => true), true);
+  assert.deepEqual(broker.resume(['req-1']), { kept: 1, denied: 0 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.deepEqual(broker.parkedRequestIds(), ['req-1']);
+
+  assert.equal(broker.commit({ requestId: 'req-1' }), true);
+  assert.deepEqual(await parked, { behavior: 'allow', scope: 'once', decidedBy: '' });
+});
+
+test('resume removes prepared state for request ids the server denied', async () => {
+  const { createPermissionBroker } = await loadPermissions();
+  const broker = createPermissionBroker({ send: () => true, idFactory: () => 'req-1' });
+  const parked = broker.request({ jobId: 'job-1', toolName: 'Edit' });
+
+  assert.equal(broker.prepare({ requestId: 'req-1', behavior: 'allow', scope: 'once' }, () => true), true);
+  assert.deepEqual(broker.resume([]), { kept: 0, denied: 1 });
+  assert.deepEqual(await parked, {
+    behavior: 'deny',
+    message: 'The connection to Agensis dropped and this request could no longer be answered. Ask again in the chat.',
+  });
+  assert.equal(broker.commit({ requestId: 'req-1' }), false);
+  assert.deepEqual(broker.parkedRequestIds(), []);
 });
 
 test('a request the server did not re-home is denied at once, not left hanging', async () => {

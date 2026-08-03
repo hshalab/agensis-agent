@@ -44,6 +44,10 @@ function parseArgs(argv) {
       if (subcommand && !subcommand.startsWith("-")) args.subcommand = rest.shift();
       else args.subcommand = "connect";
     }
+    if (args.command === "service") {
+      const subcommand = rest[0];
+      if (subcommand && !subcommand.startsWith("-")) args.subcommand = rest.shift();
+    }
   }
 
   for (let i = 0; i < rest.length; i += 1) {
@@ -105,6 +109,10 @@ function parseArgs(argv) {
       args.autoUpdate = false;
       continue;
     }
+    if (key === "follow") {
+      args.follow = true;
+      continue;
+    }
     if (key === "yolo" || key === "noSandbox") {
       args.permissionMode = "yolo";
       continue;
@@ -139,6 +147,7 @@ Usage:
   agensis connect [--profile <name>]
   agensis setup [--url <agensis-url>] [--profile <name>] [--handle <name>]
   agensis supervise [--profile <name>]
+  agensis service install|status|logs|uninstall [--profile <name>]
   agensis buddy connect --key <cbk_...> [--url <agensis-url>] [options]
 
 Required:
@@ -199,9 +208,21 @@ agensis supervise [--profile <name>] [--poll-ms <ms>] [--no-auto-update] [--auto
   can request a self-update (writing update-request.json into its own state
   dir) with automatic install + health-check + rollback to the last-known-good
   version on failure. Requires a saved profile (run "agensis setup" or
-  "agensis connect" once first). Recommended under a process manager with its
-  own restart policy (systemd Restart=always, launchd KeepAlive, pm2) so the
-  supervisor itself is recovered if it's ever killed.
+  "agensis connect" once first).
+
+agensis service install [--profile <name>]
+  Installs "agensis supervise" as a per-user background service. macOS uses a
+  LaunchAgent with RunAtLoad + KeepAlive; Linux uses a systemd user unit with
+  Restart=always. The service file contains the profile NAME, executable paths,
+  and log paths only. The connection token stays in the mode-0600 profile.
+
+agensis service status [--profile <name>]
+agensis service logs [--profile <name>] [--follow]
+agensis service uninstall [--profile <name>]
+  Status reports installed/running state. Logs prints the stdout/stderr paths;
+  it follows them only with --follow. Uninstall disables and removes only the
+  selected profile service. Windows background service installation is not yet
+  supported.
 `;
 }
 
@@ -270,6 +291,54 @@ async function main() {
     });
     return;
   }
+  if (args.command === "service") {
+    const profile = daemonProfileName(args.profile || "default");
+    const {
+      installSupervisorService,
+      supervisorServiceLogs,
+      supervisorServiceStatus,
+      uninstallSupervisorService,
+    } = await import("../src/service.mjs");
+    if (args.subcommand === "install") {
+      const result = await installSupervisorService({
+        profileName: profile,
+        executablePath: process.argv[1],
+      });
+      process.stdout.write(
+        `[agensis] Installed and started service "${result.serviceName}" for profile "${profile}".\n` +
+        `[agensis] Definition: ${result.definitionPath}\n` +
+        `[agensis] Logs: ${result.stdoutPath} and ${result.stderrPath}\n`,
+      );
+      return;
+    }
+    if (args.subcommand === "status") {
+      const result = await supervisorServiceStatus({ profileName: profile });
+      process.stdout.write(
+        `Profile: ${profile}\n` +
+        `Service: ${result.serviceName}\n` +
+        `Installed: ${result.installed ? "yes" : "no"}\n` +
+        `Running: ${result.running ? "yes" : "no"}\n` +
+        `Definition: ${result.definitionPath}\n`,
+      );
+      return;
+    }
+    if (args.subcommand === "logs") {
+      await supervisorServiceLogs({ profileName: profile, follow: args.follow === true });
+      return;
+    }
+    if (args.subcommand === "uninstall") {
+      const result = await uninstallSupervisorService({ profileName: profile });
+      process.stdout.write(
+        `[agensis] ${result.removed ? "Removed" : "No installed definition for"} ` +
+        `service "${result.serviceName}" (profile "${profile}").\n`,
+      );
+      return;
+    }
+    throw new Error(
+      `Unknown service command "${args.subcommand || ""}". ` +
+      'Use "agensis service install", "status", "logs", or "uninstall".',
+    );
+  }
   if (args.command === "setup") {
     const daemonArgs = await runSetupFlow(args);
     daemonArgs.exitOnOnce = true;
@@ -278,7 +347,10 @@ async function main() {
     return;
   }
   if (args.command !== "connect") {
-    throw new Error(`Unknown command "${args.command}". Use "agensis setup", "agensis connect --url ...", "agensis supervise", or "agensis buddy connect --key ...".`);
+    throw new Error(
+      `Unknown command "${args.command}". Use "agensis setup", "agensis connect --url ...", ` +
+      '"agensis supervise", "agensis service install", or "agensis buddy connect --key ...".',
+    );
   }
   const daemonArgs = await daemonArgsForConnect(args);
   daemonArgs.exitOnOnce = true;

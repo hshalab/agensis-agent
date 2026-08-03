@@ -20,7 +20,7 @@
     ".": "./src/agensis.mjs"
   },
   "scripts": {
-    "check": "node --check bin/agensis.mjs && node --check src/agensis.mjs && node --check src/ampRuntime.mjs && node --check src/cli.mjs && node --check src/queue.mjs && node --check src/memory.mjs && node --check src/skills.mjs && node --check src/slashEnum.mjs && node --check src/setupFlow.mjs && node --check src/cursorbuddyLocalBridge.mjs && node --check src/sharedInference.mjs && node --check src/executor.mjs && node --check src/connectionExecutors.mjs && node --check src/permissions.mjs && node --check src/sandbox/e2b.mjs && node --check src/state.mjs && node --check src/selfUpdate.mjs && node --check src/supervise.mjs && node --check src/acp/resolve.mjs && node --check src/acp/harnesses.mjs && node --check src/acp/client.mjs && node --check src/acp/executor.mjs && node --check src/acp/direct.mjs",
+    "check": "node --check bin/agensis.mjs && node --check src/agensis.mjs && node --check src/ampRuntime.mjs && node --check src/cli.mjs && node --check src/queue.mjs && node --check src/memory.mjs && node --check src/skills.mjs && node --check src/slashEnum.mjs && node --check src/setupFlow.mjs && node --check src/cursorbuddyLocalBridge.mjs && node --check src/sharedInference.mjs && node --check src/executor.mjs && node --check src/connectionExecutors.mjs && node --check src/permissions.mjs && node --check src/sandbox/e2b.mjs && node --check src/state.mjs && node --check src/selfUpdate.mjs && node --check src/supervise.mjs && node --check src/acp/resolve.mjs && node --check src/acp/harnesses.mjs && node --check src/acp/client.mjs && node --check src/acp/executor.mjs && node --check src/acp/direct.mjs && node --check src/service.mjs",
     "link": "npm link && bun link",
     "pack:dry-run": "npm pack --dry-run",
     "prepack": "npm run check",
@@ -46,6 +46,7 @@
     "src/state.mjs",
     "src/selfUpdate.mjs",
     "src/supervise.mjs",
+    "src/service.mjs",
     "src/sharedInference.mjs",
     "README.md",
     "LICENSE"

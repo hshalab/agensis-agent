@@ -52,6 +52,43 @@ agensis connect --url ... --token ... --workspace ... --agent ...
 The command stays connected, sends heartbeats, accepts queued jobs, and exits on
 Ctrl+C.
 
+## Keep The Agent Running
+
+The first successful `agensis setup` or full `agensis connect` saves a complete
+daemon profile with mode 0600. With the CLI installed globally, install that
+profile as a per-user background service:
+
+```sh
+agensis service install --profile default
+agensis service status --profile default
+agensis service logs --profile default
+```
+
+macOS uses a user LaunchAgent with `RunAtLoad` and `KeepAlive`. Linux uses a
+systemd user unit with `Restart=always`. Both run `agensis supervise`, so the
+daemon is restarted after crashes and can use its existing update/health-check/
+rollback flow. Quitting the terminal or desktop app does not stop it.
+
+The plist/unit contains the profile name, executable path, PATH search
+directories, and stdout/stderr paths only. It never contains the connection
+token, workspace id, agent id, or working directory; those stay in
+`~/.agensis/daemon-profiles/<profile>.json`.
+
+```sh
+# Print the two log paths without reading/following them
+agensis service logs --profile default
+
+# Explicitly live-tail both logs
+agensis service logs --profile default --follow
+
+# Disable, unload, and remove only this profile's service
+agensis service uninstall --profile default
+```
+
+Windows service installation is not implemented. `agensis service` fails
+without changing the machine; run `agensis supervise --profile <name>` under a
+per-user process manager you already operate.
+
 ## Options
 
 Required:
@@ -82,6 +119,7 @@ Optional:
 - `--share`: advertise the models in `--shared-models-file` to this workspace
 - `--shared-models-file <path>`: JSON configuration for loopback OpenAI-compatible models
 - `--once`: run one queued job then exit
+- `--profile <name>`: select a saved profile for connect, supervise, or service commands
 - `--version`: print the CLI version
 - `--help`: show help
 
