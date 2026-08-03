@@ -108,7 +108,18 @@ export function createAcpExecutor(ctx = {}) {
           acp: false,
         };
       }
-      const resolved = resolveHarness(id);
+      // Prefer the job's model (agent row) over the connect-command default so a
+      // model change in the UI takes effect without restarting the daemon.
+      const model = String(
+        opts.model
+        || opts.job?.agent?.model
+        || opts.job?.model
+        || job?.agent?.model
+        || job?.model
+        || config?.model
+        || "",
+      ).trim();
+      const resolved = resolveHarness(id, { model });
       if (!resolved) {
         acpUnavailable.add(id);
         return {
@@ -128,9 +139,10 @@ export function createAcpExecutor(ctx = {}) {
       const mcpServers = acpMcpServers(opts.mcp);
       const permissionMode = acpPermissionMode(opts.permissionMode);
       const sessionKey = String(opts.sessionKey || `${id}:${cwd}`);
-      // Tools and permission mode are fixed at session/new, so a change to either
-      // must open a NEW session rather than silently reuse one built without them.
-      const poolKey = `${id}::${sessionKey}::${permissionMode}::${mcpServers.map((s) => s.url).join(",")}`;
+      // Tools, permission mode, AND model are fixed at process/session start, so
+      // a change to any of them must open a NEW session rather than silently
+      // reuse one built with the previous selection.
+      const poolKey = `${id}::${sessionKey}::${permissionMode}::${model || "auto"}::${mcpServers.map((s) => s.url).join(",")}`;
 
       let entry = sessionPool.get(poolKey);
       if (entry?.client?.closed) {
