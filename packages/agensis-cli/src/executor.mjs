@@ -9,6 +9,8 @@
 import { runCli } from "./cli.mjs";
 import { createClaudeSdkExecutor, createCodexAppServerExecutor } from "./connectionExecutors.mjs";
 import { createPreferAcpExecutor } from "./acp/executor.mjs";
+import { preferredHarnessId } from "./acp/harnesses.mjs";
+import { createDirectExecutor, directRunnerFor } from "./acp/direct.mjs";
 
 export function createLocalExecutor({ run = runCli } = {}) {
   return { run: (opts) => run(opts) };
@@ -108,7 +110,26 @@ export function createExecutor(job, { makeProvider, family, config } = {}) {
   const classic = (family === "claude" || family === "codex")
     ? createPrimaryExecutor(family)
     : createLocalExecutor();
-  return createPreferAcpExecutor({ job, family, config, fallback: classic });
+  return createPreferAcpExecutor({ job, family, config, fallback: directFallbackFor({ job, family, config }) || classic });
+}
+
+/**
+ * The right fallback for a harness agent when ACP cannot run.
+ *
+ * Without this, a Grok/Kimi/Goose agent that loses ACP drops to LocalExecutor,
+ * which runs the generic coding command — `claude -p` by default. That is not
+ * merely slower, it answers as the WRONG MODEL: the agent silently becomes
+ * Claude. Falling back to the tool's own headless mode keeps identity intact.
+ *
+ * Returns null (keep the existing fallback) for claude / codex / amp, which
+ * have native runtimes and must not be routed through a direct spawn.
+ */
+function directFallbackFor({ job, family, config }) {
+  if (family === "claude" || family === "codex") return null;
+  const id = preferredHarnessId({ job, family, config });
+  if (!id || id === "claude" || id === "codex" || id === "amp") return null;
+  if (!directRunnerFor(id)) return null;
+  return createDirectExecutor({ harnessId: id, config });
 }
 
 // Default factory: builds a provider from job.agent.sandbox_provider + env secrets.

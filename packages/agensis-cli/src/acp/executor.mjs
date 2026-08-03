@@ -52,6 +52,119 @@ function looksLikeUnavailable(error) {
 }
 
 /**
+ * A handshake that ran out of clock is NOT the same as a missing binary.
+ *
+ * This distinction is the whole ballgame. `looksLikeUnavailable` matches
+ * "timed out", so a single slow session/new used to add the harness to
+ * `acpUnavailable` — permanently, for the entire daemon lifetime. Every
+ * subsequent turn then took the classic path, which re-spawns the CLI cold.
+ *
+ * Measured on a real Mac (2026-08, trivial prompt, grok):
+ *   warm ACP session .... 5221ms, 2525ms, 2426ms   (handshake 6331ms, paid once)
+ *   classic re-spawn ... 14191ms, 15394ms, 16956ms (paid EVERY turn)
+ *
+ * So one unlucky handshake cost ~6x on every turn thereafter. A timeout is
+ * transient: retry it, and only give up after repeated failures.
+ */
+function looksTransient(error) {
+  return /timed out/i.test(String((error && error.message) || error || ""));
+}
+
+/**
+ * Per-harness handshake budgets.
+ *
+ * The previous flat 12_000 was below what a real harness needs. Measured
+ * session/new on this machine: hermes 27311ms, grok 5773ms, goose 5ms,
+ * kimi 1063ms. Hermes could therefore NEVER complete a handshake, and grok sat
+ * at only a 2x margin — a loaded machine tips it over too.
+ *
+ * Override with AGENSIS_ACP_HANDSHAKE_MS for a host that is slower still.
+ */
+const HANDSHAKE_BUDGETS = {
+  default: { initialize: 20_000, newSession: 45_000 },
+  // Measured 27.3s cold; give real headroom rather than a value that just
+  // happens to pass on one machine.
+  hermes: { initialize: 30_000, newSession: 90_000 },
+};
+
+export function handshakeBudget(harnessId) {
+  const override = Number(process.env.AGENSIS_ACP_HANDSHAKE_MS || 0);
+  if (override > 0) return { initialize: override, newSession: override };
+  return HANDSHAKE_BUDGETS[String(harnessId || "").toLowerCase()] || HANDSHAKE_BUDGETS.default;
+}
+
+/**
+ * Consecutive handshake timeouts per harness. Cleared on any success.
+ * Only after this many in a row do we stop trying ACP for the process.
+ */
+const HANDSHAKE_STRIKES_BEFORE_GIVING_UP = 3;
+const handshakeStrikes = new Map();
+
+/**
+ * The pool identity of a session. Tools, permission mode and model are all fixed
+ * at process/session start, so any change must open a new session.
+ *
+ * Exported so prewarm computes the SAME key the first real job will look up —
+ * a prewarm under a different key is not a warm session, it is a stray process.
+ */
+export function acpPoolKey({ id, sessionKey, permissionMode, model, mcpServers = [] }) {
+  return `${id}::${sessionKey}::${permissionMode}::${model || "auto"}::${mcpServers.map((s) => s.url).join(",")}`;
+}
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+      if (typeof t.unref === "function") t.unref();
+    }),
+  ]);
+}
+
+/**
+ * Spawn a harness and complete the ACP handshake. Shared by the job path and by
+ * prewarm so both use one set of budgets and one definition of "ready".
+ */
+async function openAcpSession({ resolved, id, cwd, mcpServers, permissionMode, log = console, signal }) {
+  const client = createAcpClient({
+    command: resolved.command,
+    args: resolved.args,
+    cwd,
+    autoApprove: true,
+    // Without these the agent has no workspace tools and is asked to
+    // approve every call despite whatever mode it was configured with.
+    mcpServers,
+    permissionMode,
+    clientName: "agensis-agent",
+    onLog: () => {},
+  });
+  if (signal?.aborted) {
+    client.dispose();
+    const err = new Error("aborted");
+    err.name = "AbortError";
+    throw err;
+  }
+  // Fail when an adapter is on PATH but broken / hung — classic path takes
+  // over. Budgets are per-harness because a flat cap silently demoted the
+  // slowest (and only the slowest) harnesses to the 6x-slower path.
+  const budget = handshakeBudget(id);
+  const tHandshake = Date.now();
+  try {
+    await withTimeout(client.initialize(), budget.initialize, "ACP initialize");
+    await withTimeout(client.newSession(cwd), budget.newSession, "ACP session/new");
+  } catch (error) {
+    try { client.dispose(); } catch { /* ignore */ }
+    throw error;
+  }
+  const handshakeMs = Date.now() - tHandshake;
+  // One line per session, not per turn — the handshake is paid once and
+  // every later turn on this session reuses it.
+  log.log?.(`[acp] ${id} session ready in ${handshakeMs}ms (warm from here)`);
+  handshakeStrikes.delete(id);
+  return { client, harnessId: id, cwd };
+}
+
+/**
  * Whether ACP should be attempted for this job (default on).
  * Disable with --no-acp or AGENSIS_ACP=0.
  */
@@ -89,7 +202,7 @@ export function willUseAcp({ job, family, config } = {}) {
  * @param {{ job?: object, family?: string|null, config?: object }} ctx
  */
 export function createAcpExecutor(ctx = {}) {
-  const { job, family, config } = ctx;
+  const { job, family, config, log = console } = ctx;
   const harnessId = preferredHarnessId({ job, family, config });
   const harness = harnessId ? resolveHarness(harnessId) : null;
 
@@ -142,7 +255,7 @@ export function createAcpExecutor(ctx = {}) {
       // Tools, permission mode, AND model are fixed at process/session start, so
       // a change to any of them must open a NEW session rather than silently
       // reuse one built with the previous selection.
-      const poolKey = `${id}::${sessionKey}::${permissionMode}::${model || "auto"}::${mcpServers.map((s) => s.url).join(",")}`;
+      const poolKey = acpPoolKey({ id, sessionKey, permissionMode, model, mcpServers });
 
       let entry = sessionPool.get(poolKey);
       if (entry?.client?.closed) {
@@ -151,38 +264,11 @@ export function createAcpExecutor(ctx = {}) {
         entry = null;
       }
 
-      const withTimeout = (promise, ms, label) => Promise.race([
-        promise,
-        new Promise((_, reject) => {
-          const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
-          if (typeof t.unref === "function") t.unref();
-        }),
-      ]);
-
       try {
         if (!entry) {
-          const client = createAcpClient({
-            command: resolved.command,
-            args: resolved.args,
-            cwd,
-            autoApprove: true,
-            // Without these the agent has no workspace tools and is asked to
-            // approve every call despite whatever mode it was configured with.
-            mcpServers,
-            permissionMode,
-            clientName: "agensis-agent",
-            onLog: () => {},
+          entry = await openAcpSession({
+            resolved, id, cwd, mcpServers, permissionMode, log, signal: opts.signal,
           });
-          if (opts.signal?.aborted) {
-            client.dispose();
-            const err = new Error("aborted");
-            err.name = "AbortError";
-            throw err;
-          }
-          // Fail fast when an adapter is on PATH but broken / hung — classic path takes over.
-          await withTimeout(client.initialize(), 12_000, "ACP initialize");
-          await withTimeout(client.newSession(cwd), 12_000, "ACP session/new");
-          entry = { client, harnessId: id, cwd };
           sessionPool.set(poolKey, entry);
         }
 
@@ -215,7 +301,27 @@ export function createAcpExecutor(ctx = {}) {
           try { entry.client.dispose(); } catch { /* ignore */ }
           sessionPool.delete(poolKey);
         }
-        if (looksLikeUnavailable(error)) acpUnavailable.add(id);
+        // A timeout is transient — retry it next turn. Anything else (ENOENT,
+        // broken adapter) is structural and disables ACP immediately.
+        if (looksTransient(error)) {
+          const strikes = (handshakeStrikes.get(id) || 0) + 1;
+          handshakeStrikes.set(id, strikes);
+          log.warn?.(
+            `[acp] ${id} handshake timed out (${strikes}/${HANDSHAKE_STRIKES_BEFORE_GIVING_UP}): ${error.message}. `
+            + "Falling back to the classic path for THIS turn — it re-spawns the CLI cold and is markedly slower. "
+            + "Raise AGENSIS_ACP_HANDSHAKE_MS if this host is just slow.",
+          );
+          if (strikes >= HANDSHAKE_STRIKES_BEFORE_GIVING_UP) {
+            acpUnavailable.add(id);
+            log.warn?.(
+              `[acp] ${id} disabled for this daemon after ${strikes} consecutive handshake timeouts. `
+              + "Every turn now uses the slower classic path until restart.",
+            );
+          }
+        } else if (looksLikeUnavailable(error)) {
+          acpUnavailable.add(id);
+          log.warn?.(`[acp] ${id} unavailable (${error.message}); using the classic path for this daemon.`);
+        }
         return {
           status: null,
           stdout: "",
@@ -242,14 +348,20 @@ export function createPreferAcpExecutor({ job, family, config, fallback, log = c
       const harnessId = preferredHarnessId({ job: opts.job || job, family, config });
       if (!harnessId || !harnessAvailable(harnessId)) return classic.run(opts);
 
-      const acp = createAcpExecutor({ job: opts.job || job, family, config });
+      const acp = createAcpExecutor({ job: opts.job || job, family, config, log });
       const result = await acp.run({ ...opts, job: opts.job || job });
       if (!result.error) {
         log.log?.(`[executor] ACP harness ${result.harnessId || harnessId} completed job`);
         return result;
       }
       if (looksLikeUnavailable(result.error)) {
-        log.log?.(`[executor] ACP harness ${harnessId} unavailable (${result.error.message}); falling back to classic CLI path`);
+        // Loud, and explicit about the cost. This fallback used to be a quiet
+        // log.log at the same level as a success — which is precisely why a
+        // permanent 6x slowdown went unnoticed.
+        log.warn?.(
+          `[executor] ACP harness ${harnessId} did not run this job (${result.error.message}). `
+          + "Falling back to the classic CLI path, which starts the tool cold on every turn.",
+        );
         return classic.run(opts);
       }
       // Real job failure on ACP — do not silently re-run classic (double spend).
@@ -258,9 +370,66 @@ export function createPreferAcpExecutor({ job, family, config, fallback, log = c
   };
 }
 
+/**
+ * Open the ACP session at connect time instead of on the first job.
+ *
+ * The handshake is paid once per session either way; prewarming just moves it
+ * off the critical path so the first human-visible turn is already warm
+ * (measured: 6.3s of handshake that a person would otherwise sit through).
+ *
+ * Deliberately NEVER prewarms claude / codex / amp. Those have native lanes —
+ * the Claude Agent SDK and the Codex app-server — and are the paths that
+ * currently stream correctly. This function must not spawn anything for them.
+ *
+ * Best-effort by contract: it never throws and never blocks connect. A failure
+ * here is not a job failure — the first job simply handshakes as it does today.
+ *
+ * @returns {Promise<{ prewarmed: boolean, harnessId?: string, ms?: number, reason?: string }>}
+ */
+export async function prewarmAcpSession({ job, family, config, log = console, sessionKey, mcp } = {}) {
+  try {
+    if (!acpPreferred({ config })) return { prewarmed: false, reason: "acp disabled" };
+    const id = preferredHarnessId({ job, family, config });
+    if (!id) return { prewarmed: false, reason: "no harness" };
+    // Native lanes own these. Never pre-spawn a harness for them.
+    if (id === "claude" || id === "codex" || id === "amp") {
+      return { prewarmed: false, reason: `${id} uses its native runtime, not ACP` };
+    }
+    if (!harnessAvailable(id)) return { prewarmed: false, reason: `${id} not installed` };
+
+    const model = String(config?.model || "").trim();
+    const resolved = resolveHarness(id, { model });
+    if (!resolved) return { prewarmed: false, reason: `${id} did not resolve` };
+
+    const cwd = config?.cwd || process.cwd();
+    const mcpServers = acpMcpServers(mcp);
+    const permissionMode = acpPermissionMode(config?.permissionMode);
+    const key = acpPoolKey({
+      id,
+      sessionKey: String(sessionKey || `${id}:${cwd}`),
+      permissionMode,
+      model,
+      mcpServers,
+    });
+    if (sessionPool.has(key)) return { prewarmed: false, reason: "already warm" };
+
+    const t0 = Date.now();
+    const entry = await openAcpSession({ resolved, id, cwd, mcpServers, permissionMode, log });
+    sessionPool.set(key, entry);
+    const ms = Date.now() - t0;
+    log.log?.(`[acp] prewarmed ${id} in ${ms}ms — the first turn will not pay the handshake`);
+    return { prewarmed: true, harnessId: id, ms };
+  } catch (error) {
+    // Never let a prewarm failure affect connect. The job path retries anyway.
+    log.warn?.(`[acp] prewarm skipped: ${error?.message || error}`);
+    return { prewarmed: false, reason: String(error?.message || error) };
+  }
+}
+
 /** Test seam: clear unavailability + pool. */
 export function resetAcpExecutorState() {
   acpUnavailable.clear();
+  handshakeStrikes.clear();
   for (const entry of sessionPool.values()) {
     try { entry.client.dispose(); } catch { /* ignore */ }
   }
