@@ -16,7 +16,15 @@ export const ACP_HARNESSES = [
     resolve(opts = {}) {
       const path = resolveCommandPath("grok", opts);
       if (!path) return null;
-      return { command: path, args: ["agent", "--always-approve", "stdio"], path };
+      // Model is a top-level `grok agent -m` option, BEFORE the stdio subcommand.
+      // Without this, ACP always used ~/.grok/config.toml default and the
+      // agent's selected model (and connect --model) was silently ignored —
+      // which is how a host that could not use grok-4.5 looked "stuck" on it.
+      const model = String(opts.model || "").trim();
+      const args = ["agent"];
+      if (model && model !== "auto") args.push("-m", model);
+      args.push("--always-approve", "stdio");
+      return { command: path, args, path };
     },
   },
   {

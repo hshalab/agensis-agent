@@ -6,7 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import WebSocket from "ws";
 import { createExecutor } from "./executor.mjs";
-import { harnessAvailable } from "./acp/executor.mjs";
+import { harnessAvailable, prewarmAcpSession } from "./acp/executor.mjs";
 import { preferredHarnessId } from "./acp/harnesses.mjs";
 import { runCli } from "./cli.mjs";
 import {
@@ -589,6 +589,24 @@ export async function runAgensisDaemon(rawConfig = {}) {
         // idempotent — a no-op once it's already running.
         startLanListener();
         void pushCapabilitiesSnapshot(ws, config, currentReach());
+        // Open the ACP session now rather than on the first job, so nobody sits
+        // through the handshake. Fire-and-forget: it never throws, and a failure
+        // just leaves the first job to handshake as it does today.
+        //
+        // Slot 0 is the slot the first conversation claims (slots are [0,size)
+        // and the default size is 1), so this matches the key that job will use.
+        // Does nothing for claude/codex/amp — they use their native runtimes.
+        void prewarmAcpSession({
+          // family is derived per-job from the resolved command, so it is not
+          // known here. null is correct: preferredHarnessId then resolves from
+          // config.acpHarness (the --acp-harness flag) or config.runtime, and a
+          // classic runtime is rejected by prewarmAcpSession's own gate.
+          family: null,
+          config,
+          log: { log, warn: log },
+          sessionKey: `${config.workspace || ""}:${config.agent || config.handle || ""}#0`,
+          mcp: config.leanCli ? leanMcpRuntime(config) : null,
+        });
         return;
       }
       if (message.type === "agent_config") {
