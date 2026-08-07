@@ -1,9 +1,16 @@
 // ACP coding executor for the Relay CLI.
 // Prefers a local ACP harness when installed; same {status,stdout,stderr,error,stop}
 // contract as LocalExecutor / connection executors.
+//
+// ACP covers the harnesses this daemon has no other way to drive — grok, hermes,
+// goose, kimi, cursor, opencode, openclaw. It deliberately does NOT cover claude,
+// codex or amp: those have native runtimes (Claude Agent SDK, `codex app-server`,
+// the Amp CLI) which keep a warm session per silo and report typed tool steps,
+// text segments, stop reasons and token usage that a plain-text ACP adapter
+// cannot. See NATIVE_RUNTIME_HARNESSES in harnesses.mjs.
 
 import { createAcpClient } from "./client.mjs";
-import { preferredHarnessId, resolveHarness } from "./harnesses.mjs";
+import { preferredHarnessId, resolveHarness, usesNativeRuntime } from "./harnesses.mjs";
 
 const acpUnavailable = new Set();
 /** @type {Map<string, { client: ReturnType<typeof createAcpClient>, harnessId: string, cwd: string }>} */
@@ -180,6 +187,10 @@ export function acpPreferred({ config, env = process.env } = {}) {
 
 export function harnessAvailable(harnessId, opts = {}) {
   if (!harnessId || acpUnavailable.has(harnessId)) return false;
+  // A native runtime is never "an available ACP harness", even when its adapter
+  // happens to be installed. claude-code-acp being on PATH is not a reason to
+  // stop using the Claude Agent SDK.
+  if (usesNativeRuntime(harnessId)) return false;
   return Boolean(resolveHarness(harnessId, opts));
 }
 
@@ -211,6 +222,20 @@ export function createAcpExecutor(ctx = {}) {
     available: Boolean(harness),
     async run(opts = {}) {
       const id = harness?.id || preferredHarnessId({ job: opts.job || job, family, config });
+      // The single place an ACP adapter is ever spawned, so it is also the place
+      // the native-runtime rule has to hold no matter which caller got here.
+      // claude / codex / amp are driven directly (SDK, app-server, Amp CLI) and
+      // must not be demoted to a plain-text adapter just because one is on PATH.
+      if (usesNativeRuntime(id)) {
+        return {
+          status: null,
+          stdout: "",
+          stderr: "",
+          error: new Error(`${id} runs on its native runtime, not ACP`),
+          stop: null,
+          acp: false,
+        };
+      }
       if (!id || acpUnavailable.has(id)) {
         return {
           status: null,
@@ -339,6 +364,10 @@ export function createAcpExecutor(ctx = {}) {
 /**
  * Prefer ACP when harness is available; otherwise use `fallback` executor.
  * Once a harness is marked unavailable, skips ACP for the process lifetime.
+ *
+ * Native runtimes (claude / codex / amp) never reach the ACP branch — see
+ * harnessAvailable. createExecutor does not even wrap them in this executor;
+ * the gate here is the backstop for any other caller.
  */
 export function createPreferAcpExecutor({ job, family, config, fallback, log = console } = {}) {
   const classic = fallback;
@@ -392,7 +421,7 @@ export async function prewarmAcpSession({ job, family, config, log = console, se
     const id = preferredHarnessId({ job, family, config });
     if (!id) return { prewarmed: false, reason: "no harness" };
     // Native lanes own these. Never pre-spawn a harness for them.
-    if (id === "claude" || id === "codex" || id === "amp") {
+    if (usesNativeRuntime(id)) {
       return { prewarmed: false, reason: `${id} uses its native runtime, not ACP` };
     }
     if (!harnessAvailable(id)) return { prewarmed: false, reason: `${id} not installed` };

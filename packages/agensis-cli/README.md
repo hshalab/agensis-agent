@@ -4,12 +4,21 @@
 `@agensis/agensis-agent`). The installed command is `agensis`.
 
 It connects over WebSocket, receives jobs for agents set to **Relay** in the UI,
-and executes them via **ACP when a local harness is available** (same adapters
-desktop uses), otherwise the classic Claude/Codex SDK or subprocess path.
+and executes them on the best available runtime:
+
+1. **Claude** on the Claude Agent SDK and **Codex** on `codex app-server` — a
+   warm session per workspace+agent, with tool steps, stop reasons, and token
+   usage. Installing an ACP adapter for either does not change this.
+2. **ACP** for the harnesses with no native lane here (Hermes, Grok, Goose,
+   Kimi, Cursor, OpenCode, OpenClaw) — the same adapters desktop uses.
+3. The classic subprocess path (`claude -p`, `codex exec`, custom `--coding-cmd`)
+   when neither applies.
+
 **Direct** agents run on agensis servers. **Connector** is MCP.
 
 `--no-acp` / `AGENSIS_ACP=0` force classic execution. `--acp-harness <id>` or
-agent `metadata.acp_harness` selects Hermes/Grok/Claude ACP/etc.
+agent `metadata.acp_harness` selects Hermes/Grok/Goose/etc; it does not apply to
+claude, codex, or amp.
 
 This workspace contains the readable source for the published package.
 

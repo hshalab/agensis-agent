@@ -1,9 +1,11 @@
 # @agensis/agensis-agent
 
 **Relay host** for [agensis](https://agensis.io) workspace agents — run jobs on
-this machine. Desktop ACP uses the same Relay path from the app; this CLI can
-use **ACP when a harness is installed** (claude-agent-acp, codex-acp, hermes,
-grok, …) and falls back to classic CLI/SDK execution when it is not.
+this machine. Desktop ACP uses the same Relay path from the app. This CLI runs
+Claude on the **Claude Agent SDK** and Codex on **`codex app-server`**, uses
+**ACP** for harnesses with no native lane (hermes, grok, goose, kimi, cursor,
+opencode, openclaw), and falls back to classic CLI execution when neither
+applies.
 
 It connects to an agensis workspace over WebSocket, receives `@mention` jobs,
 runs the local harness or coding CLI in the folder you start it from, and posts
@@ -14,8 +16,10 @@ In the Agents UI, set the agent to **Relay** (not Direct). Direct runs on
 agensis servers; this package only serves Relay agents. **Connector** is MCP
 and is a separate attach path.
 
-Prefer ACP by default. Disable with `--no-acp` or `AGENSIS_ACP=0`. Pin a harness
-with `--acp-harness hermes` (or agent `metadata.acp_harness`).
+ACP is on by default for the harnesses that need it. Disable it with `--no-acp`
+or `AGENSIS_ACP=0`. Pin a harness with `--acp-harness hermes` (or agent
+`metadata.acp_harness`); claude, codex, and amp ignore it and always use their
+native runtimes.
 
 ## Install
 

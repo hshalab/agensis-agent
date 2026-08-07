@@ -1,7 +1,31 @@
 // ACP harness catalog for the Relay CLI — same spawn recipes as desktop Electron.
-// When a harness is available we prefer ACP; otherwise classic subprocess/SDK paths run.
+// ACP is for the harnesses that have no other lane here (grok, hermes, goose,
+// kimi, cursor, opencode, openclaw). claude / codex / amp are NOT among them —
+// see NATIVE_RUNTIME_HARNESSES below.
 
 import { resolveCommandPath } from "./resolve.mjs";
+
+/**
+ * Runtimes this daemon drives directly, and which therefore must never be
+ * routed through an ACP adapter.
+ *
+ * - claude -> @anthropic-ai/claude-agent-sdk query() (connectionExecutors.mjs)
+ * - codex  -> `codex app-server` over stdio JSON-RPC (connectionExecutors.mjs)
+ * - amp    -> the Amp CLI thread runtime (ampRuntime.mjs)
+ *
+ * Each keeps ONE warm session per silo across jobs and reports typed events —
+ * tool steps, text segments, stop reasons, token usage. An ACP adapter for the
+ * same tool returns plain text and none of that, so preferring it is a
+ * downgrade, not a fast lane. This was already the rule for prewarming and for
+ * the direct-spawn fallback; it is stated once here so the job path cannot
+ * drift from it again.
+ */
+export const NATIVE_RUNTIME_HARNESSES = Object.freeze(["claude", "codex", "amp"]);
+
+/** Does `harnessId` name a runtime this daemon drives natively? */
+export function usesNativeRuntime(harnessId) {
+  return NATIVE_RUNTIME_HARNESSES.includes(String(harnessId || "").trim().toLowerCase());
+}
 
 /**
  * @typedef {{ id: string, label: string, resolve: (opts?: object) => { command: string, args: string[], path: string } | null, installHint?: string }} AcpHarness
@@ -124,6 +148,14 @@ export const ACP_HARNESSES = [
   },
 ];
 
+/**
+ * Every catalogued adapter and whether it is installed here.
+ *
+ * `available` answers "is this adapter on PATH", NOT "will this run over ACP" —
+ * claude / codex / amp can report true here and still, correctly, run on their
+ * native runtimes. Ask harnessAvailable() in acp/executor.mjs for the routing
+ * question.
+ */
 export function listHarnesses(opts = {}) {
   return ACP_HARNESSES.map((h) => {
     const resolved = h.resolve(opts);

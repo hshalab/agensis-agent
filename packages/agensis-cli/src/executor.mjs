@@ -6,10 +6,13 @@
 // LocalExecutor the first time that connection proves unavailable on this
 // host. SandboxExecutor runs the same {cmd,args} in a remote sandbox via an
 // injected provider. createExecutor picks one by run_mode + coding-CLI family.
+//
+// Claude and Codex go straight to PrimaryExecutor. ACP is only for the
+// harnesses with no native lane here — see createExecutor below.
 import { runCli } from "./cli.mjs";
 import { createClaudeSdkExecutor, createCodexAppServerExecutor } from "./connectionExecutors.mjs";
 import { createPreferAcpExecutor } from "./acp/executor.mjs";
-import { preferredHarnessId } from "./acp/harnesses.mjs";
+import { preferredHarnessId, usesNativeRuntime } from "./acp/harnesses.mjs";
 import { createDirectExecutor, directRunnerFor } from "./acp/direct.mjs";
 
 export function createLocalExecutor({ run = runCli } = {}) {
@@ -94,12 +97,25 @@ export function createSandboxExecutor(provider) {
 /**
  * Pick how a coding job runs on this host.
  *
- * Prefer ACP when a harness is installed (claude-agent-acp, codex-acp, hermes, …)
- * so the Relay CLI can use the same local adapters as desktop. Fall back to:
- *   - warm SDK / app-server (claude / codex families)
- *   - classic subprocess (`claude -p` / `codex exec` / custom coding-cmd)
+ * Order of preference:
+ *   1. Native runtime — the Claude Agent SDK for `claude`, `codex app-server`
+ *      for `codex`. These are the fast lane AND the rich one: one warm session
+ *      per silo, plus typed tool steps, text segments, stop reasons and token
+ *      usage. They are chosen outright, never put behind ACP.
+ *   2. ACP — for the harnesses that have no native lane here (hermes, grok,
+ *      goose, kimi, cursor, opencode, openclaw), so the Relay CLI can use the
+ *      same local adapters as desktop.
+ *   3. Classic subprocess (`claude -p` / `codex exec` / custom coding-cmd), or
+ *      the harness's own headless mode, when neither of the above applies.
  *
- * Disable ACP with --no-acp or AGENSIS_ACP=0.
+ * 0.1.48 wrapped EVERY job in createPreferAcpExecutor, and preferredHarnessId
+ * answers "claude"/"codex" for those families — so merely having
+ * claude-code-acp on PATH silently demoted Claude jobs from the SDK to a
+ * plain-text adapter, losing the step strip, segments, stop reasons and usage
+ * counts with nothing in the logs to say why. Native runtimes are now chosen
+ * before ACP is considered at all.
+ *
+ * Disable ACP entirely with --no-acp or AGENSIS_ACP=0.
  */
 export function createExecutor(job, { makeProvider, family, config } = {}) {
   const runMode = job && job.agent && job.agent.run_mode;
@@ -107,10 +123,11 @@ export function createExecutor(job, { makeProvider, family, config } = {}) {
     const factory = makeProvider || defaultSandboxProviderFactory;
     return createSandboxExecutor(factory(job));
   }
-  const classic = (family === "claude" || family === "codex")
-    ? createPrimaryExecutor(family)
-    : createLocalExecutor();
-  return createPreferAcpExecutor({ job, family, config, fallback: directFallbackFor({ job, family, config }) || classic });
+  // A resolved family IS the statement that this host can drive the tool
+  // natively: agensis.mjs only sets it when fast connections are enabled and the
+  // command is the bare `claude`/`codex` binary. Nothing else may pre-empt it.
+  if (family === "claude" || family === "codex") return createPrimaryExecutor(family);
+  return createPreferAcpExecutor({ job, family, config, fallback: directFallbackFor({ job, family, config }) || createLocalExecutor() });
 }
 
 /**
@@ -127,7 +144,7 @@ export function createExecutor(job, { makeProvider, family, config } = {}) {
 function directFallbackFor({ job, family, config }) {
   if (family === "claude" || family === "codex") return null;
   const id = preferredHarnessId({ job, family, config });
-  if (!id || id === "claude" || id === "codex" || id === "amp") return null;
+  if (!id || usesNativeRuntime(id)) return null;
   if (!directRunnerFor(id)) return null;
   return createDirectExecutor({ harnessId: id, config });
 }

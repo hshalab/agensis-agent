@@ -17,9 +17,12 @@ import assert from "node:assert/strict";
 
 import {
   acpPoolKey,
+  createAcpExecutor,
   handshakeBudget,
+  harnessAvailable,
   prewarmAcpSession,
   resetAcpExecutorState,
+  willUseAcp,
 } from "../packages/agensis-cli/src/acp/executor.mjs";
 import {
   DIRECT_RUNNERS,
@@ -27,6 +30,7 @@ import {
   parseStreamLine,
   textFromStreamLine,
 } from "../packages/agensis-cli/src/acp/direct.mjs";
+import { resolveHarness, usesNativeRuntime } from "../packages/agensis-cli/src/acp/harnesses.mjs";
 
 test("handshake budgets clear the real measured cost", () => {
   // hermes measured 27311ms; the old flat cap was 12000ms, so it could never
@@ -92,6 +96,44 @@ test("prewarm never throws, even on a harness that cannot resolve", async () => 
   });
   assert.equal(result.prewarmed, false);
   assert.ok(typeof result.reason === "string" && result.reason.length > 0);
+});
+
+test("an installed ACP adapter never takes a native runtime off its own lane", async () => {
+  // THE 0.1.55 REGRESSION. Merely having claude-code-acp on PATH was enough for
+  // preferredHarnessId + createPreferAcpExecutor to route Claude jobs over ACP,
+  // losing the SDK's tool steps, segments, stop reasons and usage counts. The
+  // routing side of this is pinned in native-runtime-lane.test.mjs; here is the
+  // gate itself, which must hold no matter which caller reaches it.
+  resetAcpExecutorState();
+  const prev = process.env.AGENSIS_ACP;
+  process.env.AGENSIS_ACP = "1"; // the suite runs with ACP off; force it on
+  try {
+    for (const id of ["claude", "codex", "amp"]) {
+      assert.equal(usesNativeRuntime(id), true, `${id} must be a native runtime`);
+      assert.equal(harnessAvailable(id), false, `${id} must never present itself as an ACP lane`);
+      assert.equal(willUseAcp({ family: id, config: {} }), false, `${id} must never be predicted to run over ACP`);
+      // Whatever a caller believes, the spawn site itself refuses.
+      const res = await createAcpExecutor({ config: { acpHarness: id }, log: { log() {}, warn() {} } })
+        .run({ prompt: "hi", cwd: process.cwd() });
+      assert.equal(res.acp, false, `${id} must not report an ACP run`);
+      assert.match(res.error.message, /native runtime/, `${id} must be refused for the right reason`);
+    }
+  } finally {
+    if (prev === undefined) delete process.env.AGENSIS_ACP;
+    else process.env.AGENSIS_ACP = prev;
+  }
+});
+
+test("a harness with no native lane is still an ACP lane", () => {
+  // The control for the test above: without it, a harnessAvailable() that
+  // returned false for EVERYTHING would pass and ACP would be dead code.
+  resetAcpExecutorState();
+  const installed = ["hermes", "grok", "goose", "kimi", "cursor", "opencode", "openclaw"]
+    .filter((id) => resolveHarness(id));
+  if (!installed.length) return; // this host has no adapters; nothing to prove
+  for (const id of installed) {
+    assert.equal(harnessAvailable(id), true, `${id} is installed and must remain an ACP lane`);
+  }
 });
 
 test("there is no direct runner for claude, codex or amp", () => {

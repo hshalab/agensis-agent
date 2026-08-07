@@ -162,9 +162,12 @@ Options:
   --name <name>           Display name
   --cwd <path>            Folder where the coding CLI runs
   --runtime <runtime>     Executor runtime: claude, codex, or amp
-  --acp-harness <id>      Prefer this ACP harness when available (claude, codex,
-                          hermes, grok, goose, …). Default: from agent metadata
-                          or --runtime / coding family
+  --acp-harness <id>      Prefer this ACP harness when available (hermes, grok,
+                          goose, kimi, cursor, opencode, openclaw). Default: from
+                          agent metadata or --runtime / coding family. Ignored
+                          for claude, codex and amp — they always use their
+                          native runtimes (Claude Agent SDK, codex app-server,
+                          Amp CLI)
   --no-acp                Disable ACP; always use classic CLI/SDK execution
   --host-folder <path>    Extra folder the coding CLI may read/write (repeatable; passed as --add-dir)
   --coding-cmd <command>  Command used for jobs, default: claude -p

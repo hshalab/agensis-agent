@@ -75,7 +75,7 @@ const DEFAULT_MAX_CONCURRENCY = 2;
 const DEFAULT_SESSION_SLOTS = 1;
 const LEAN_PROMPT_MAX_BYTES = 10 * 1024;
 const DEFAULT_MODEL = "claude-opus-4-8";
-export const AGENSIS_CLI_VERSION = "0.1.55";
+export const AGENSIS_CLI_VERSION = "0.1.56";
 
 export async function runAgensisDaemon(rawConfig = {}) {
   const config = normalizeConfig(rawConfig);
@@ -966,9 +966,11 @@ function normalizeConfig(raw) {
     // subprocess-per-job behavior automatically if that connection isn't
     // available on this host, or always if the operator opts out here.
     //
-    // ACP (Agent Client Protocol) is preferred when a harness is installed
-    // (claude-agent-acp, codex-acp, hermes, grok, …) so this Relay CLI can use
-    // the same local adapters as desktop. Opt out with --no-acp / AGENSIS_ACP=0.
+    // ACP (Agent Client Protocol) runs the harnesses this daemon cannot drive
+    // natively — hermes, grok, goose, kimi, cursor, opencode, openclaw — so this
+    // Relay CLI can use the same local adapters as desktop. It is NOT used for
+    // claude, codex or amp: those keep their native runtimes above even when an
+    // ACP adapter for them is installed. Opt out with --no-acp / AGENSIS_ACP=0.
     acp: !booleanOption(raw.noAcp, false),
     noAcp: booleanOption(raw.noAcp, false),
     acpHarness: String(raw.acpHarness || process.env.AGENSIS_ACP_HARNESS || "").trim().toLowerCase() || "",
@@ -1640,14 +1642,16 @@ async function buildPrompt(config, job) {
   const tools = Array.isArray(agent.tools) ? agent.tools.join(", ") : String(agent.tools || "");
   const model = resolveJobModel(config, job);
   const permissionMode = resolveJobPermissionMode(config, job);
-  // When this turn runs on a non-Claude ACP harness, the configured model name is
-  // not what answers — the harness brings its own model. Telling Grok or Goose
+  // When this turn runs on an ACP harness, the configured model name is not what
+  // answers — the harness brings its own model. Telling Grok or Goose
   // "Requested model: claude-opus-5" is simply false, and the agent repeats it: it
   // introduces itself as a Claude model and lists Claude models as its own.
+  //
+  // harnessAvailable is already false for claude / codex / amp (they run on their
+  // native runtimes, where the requested model IS honoured), so this asks exactly
+  // one question: is some OTHER tool's model about to answer?
   const acpHarnessId = preferredHarnessId({ job, config });
-  const harnessRunsOwnModel = Boolean(
-    acpHarnessId && acpHarnessId !== "claude" && harnessAvailable(acpHarnessId),
-  );
+  const harnessRunsOwnModel = Boolean(acpHarnessId && harnessAvailable(acpHarnessId));
   // Editable "what to do on each heartbeat" doc. Inlined so the agent sees its recurring
   // instructions without a tool call; the path is given so it can edit them.
   const heartbeatMd = await readHeartbeatMd(config).catch(() => null);
